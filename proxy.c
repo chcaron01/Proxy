@@ -52,10 +52,8 @@ void error(char *msg) {
 int main(int argc, char **argv) {
   int parentfd; /* parent socket */
   int childfd; /* child socket */
-  int portno; /* port to listen on */
   int clientlen; /* byte size of client's address */
   struct sockaddr_in serveraddr; /* server's addr */
-  struct sockaddr_in clientaddr; /* client addr */
   struct hostent *hostp; /* client host info */
   char *buf = malloc(BUFSIZE); /* message buffer */
   char *hostaddrp; /* dotted decimal host addr string */
@@ -66,7 +64,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s <port>\n", argv[0]);
     exit(1);
   }
-  portno = atoi(argv[1]);
+  int portno = atoi(argv[1]);
+  fd_set active_fd_set, read_fd_set;
+  int i;
+  struct sockaddr_in clientname;
 
   entry* cache = (entry*)malloc(sizeof(entry) * ENTRIES);
   initialize_cache(cache);
@@ -99,43 +100,69 @@ int main(int argc, char **argv) {
        sizeof(serveraddr)) < 0) 
     error("ERROR on binding");
 
-  if (listen(parentfd, 5) < 0) /* allow 5 requests to queue up */ 
+  if (listen(parentfd, 1) < 0)
     error("ERROR on listen");
 
-  clientlen = sizeof(clientaddr);
-  while (1) {
-    childfd = accept(parentfd, (struct sockaddr *) &clientaddr, &clientlen);
-    if (childfd < 0) 
-      error("ERROR on accept");
-    
-    hostp = gethostbyaddr((const char *)&clientaddr.sin_addr.s_addr, 
-              sizeof(clientaddr.sin_addr.s_addr), AF_INET);
-    if (hostp == NULL)
-      error("ERROR on gethostbyaddr");
-    hostaddrp = inet_ntoa(clientaddr.sin_addr);
-    if (hostaddrp == NULL)
-      error("ERROR on inet_ntoa\n");
-    printf("server established connection with %s (%s)\n", 
-       hostp->h_name, hostaddrp);
-    
-    bzero(buf, BUFSIZE);
-    n = read(childfd, buf, BUFSIZE);
-    if (n < 0) 
-      error("ERROR reading from socket");
-    printf("server received %d bytes: %s", n, buf);
+  FD_ZERO (&active_fd_set);
+  FD_SET (parentfd, &active_fd_set);
 
-    int bytes_read = 0;
-    int status = check_cache(buf, cache, lru, &filled, &bytes_read);
-    if (status != -1) {
-      status = send_to_server(buf, cache, lru, status, &bytes_read);
+  clientlen = sizeof(clientname);
+  while (1) {
+    read_fd_set = active_fd_set;
+    int select_val = select (FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
+    if (select_val < 0)
+      {
+        perror ("select");
+        exit (EXIT_FAILURE);
+      }
+    for (i = 0; i < FD_SETSIZE; ++i) {
+        if (FD_ISSET (i, &read_fd_set)) {
+            if (i == parentfd) {
+              int new;
+              new = accept (parentfd, (struct sockaddr *) &clientname,(socklen_t *) &clientlen);
+              if (new < 0)
+                  {
+                    perror ("accept");
+                    exit (EXIT_FAILURE);
+                  }
+                fprintf (stderr,
+                         "Server: connect from host %s, port %hd.\n",
+                         inet_ntoa (clientname.sin_addr),
+                         ntohs (clientname.sin_port));
+                FD_SET (new, &active_fd_set);
+            }
+            else {
+                hostp = gethostbyaddr((const char *)&clientname.sin_addr.s_addr, 
+                          sizeof(clientname.sin_addr.s_addr), AF_INET);
+                if (hostp == NULL)
+                  error("ERROR on gethostbyaddr");
+                hostaddrp = inet_ntoa(clientname.sin_addr);
+                if (hostaddrp == NULL)
+                  error("ERROR on inet_ntoa\n");
+                printf("server established connection with %s (%s)\n", 
+                   hostp->h_name, hostaddrp);
+                
+                bzero(buf, BUFSIZE);
+                n = read(i, buf, BUFSIZE);
+                if (n < 0) 
+                  error("ERROR reading from socket");
+                printf("server received %d bytes: %s", n, buf);
+                int bytes_read = 0;
+                int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+                if (status != -1) {
+                  status = send_to_server(buf, cache, lru, status, &bytes_read);
+                }
+                
+                if (status) {
+                  n = write(i, buf, bytes_read);
+                  if (n < 0) 
+                    error("ERROR writing to socket");
+                }
+                close(i);
+                FD_CLR (i, &active_fd_set);
+            }
+        }
     }
-    
-    if (status) {
-      n = write(childfd, buf, bytes_read);
-      if (n < 0) 
-        error("ERROR writing to socket");
-    }
-    close(childfd);
   }
 }
 
