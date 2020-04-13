@@ -129,7 +129,10 @@ int main(int argc, char **argv) {
 
     int bytes_read = 0;
     int status = check_cache(buf, cache, lru, &filled, &bytes_read, childfd);
-    if (status != -1) {
+    if (status == -2) {
+      continue;
+    }
+    else if (status != -1) {
       status = send_to_server(buf, cache, lru, status, &bytes_read);
     }
     
@@ -252,7 +255,6 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     }
     
     update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
-    printf("What\n");
     printf("Echo from server: %s\n", buf);
     close(sockfd);
     return 1;
@@ -269,7 +271,8 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
     int result = connect_protocol(buf, *bytes_read, clientfd);
     if (!result)
       error("Connect method failed");
-    return -1;
+    printf("Connect completed\n");
+    return -2;
   }
   else if (strcmp(method, "GET") != 0) {
     return -1;
@@ -344,7 +347,7 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
 }
 
 int connect_protocol(char* buf, int bytes_read, int clientfd) {
-    int sockfd, portno, n;
+    int serverfd, portno, n;
     struct sockaddr_in serveraddr;
     struct hostent *server;
     char *hostname;
@@ -378,8 +381,8 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     // Make connection with server
 
     /* socket: create the socket */
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
+    serverfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverfd < 0) {
         error("ERROR opening socket");
         return 0;
     }
@@ -392,7 +395,7 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     serveraddr.sin_port = htons(portno);
 
     /* connect: create a connection with the server */
-    if (connect(sockfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) {
+    if (connect(serverfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) {
       error("ERROR connecting");
       return 0;
     }
@@ -400,9 +403,9 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     printf("Connected to requested server\n");
 
     // Report to the client that connection was successful
-    char* okay_response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    char* okay_response = "HTTP/1.1 200 OK\r\n\r\n";
 
-    n = write(clientfd, okay_response, strlen(okay_response)+1);
+    n = write(clientfd, okay_response, strlen(okay_response));
     if (n < 0) {
       error("ERROR writing to client");
       return 0;
@@ -410,97 +413,60 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
 
     printf("Okay response sent to client\n");
 
-    // Ask client for a message to forward
-    bzero(buf, BUFSIZE);
-    n = read(clientfd, buf, BUFSIZE);
-    int bytes = n;
-    if (n < 0) {
-      error("ERROR reading from client");
-      return 0;
+    fd_set active_fd_set, read_fd_set;
+
+    FD_ZERO (&active_fd_set);
+    FD_SET (clientfd, &active_fd_set);
+    FD_SET (serverfd, &active_fd_set);
+    while (1) {
+      read_fd_set = active_fd_set;
+      int select_val = select (FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
+      if (select_val < 0) {
+        perror ("select");
+        exit (EXIT_FAILURE);
+      }
+
+      for (int i = 0; i < FD_SETSIZE; ++i) {
+        if (FD_ISSET (i, &read_fd_set)) {
+          printf("Reading on socket %d\n", i);
+          int readfd;
+          int writefd;
+          if (i == clientfd) {
+            readfd = clientfd;
+            writefd = serverfd;
+          }
+          else if (i == serverfd) {
+            readfd = serverfd;
+            writefd = clientfd;
+          }
+          else {
+            printf("ERROR Unexpected socket\n");
+            return 0;
+          }
+
+          bzero(buf, BUFSIZE);
+          n = read(readfd, buf, BUFSIZE);
+          printf("Read %d bytes\n", n);
+          if (n < 0) {
+            error("ERROR reading for tunnel");
+            close(writefd);
+            return 0;
+          }
+          else if (n == 0) {
+            close(readfd);
+            close(writefd);
+            return 1;
+          }
+
+          n = write(writefd, buf, n);
+          if (n < 0) {
+            error("ERROR writing for tunnel");
+            close(readfd);
+            return 0;
+          }
+        }
+      }
     }
-
-    printf("Read the gibberish from client\n");
-
-    /* send the message line to the server */
-    n = write(sockfd, buf, bytes);
-    if (n < 0) {
-      error("ERROR writing to socket");
-      return 0;
-    }
-
-    printf("Forwarded to server\n");
-
-    bzero(buf, BUFSIZE);
-    // int target = 4000;
-    // int header_length = 0;
-    // int cl_found = 0;
-
-    printf("Loop %d\n", i);
-    bytes = read(sockfd, buf, BUFSIZE);
-    if (n < 0) {
-      error("ERROR reading from server");
-      return 0;
-    }
-
-    printf("Read from server\n");
-
-    n = write(clientfd, buf, bytes+1);
-    if (n < 0) {
-      error("ERROR writing to client");
-      return 0;
-    }
-
-
-
-    printf("Forwarded to client\n");
-
-    close(sockfd);
-    return 1;
-
-
-    // RYAN: Might need to implement some form of reading full response, TBD
-    // do {
-    //   n = read(sockfd, buf + bytes_read, BUFSIZE - bytes_read);
-    //   if (!cl_found) {
-    //     //Get CONTENT length
-    //     char* cl = strstr(buf, "Content-Length: ");
-    //     if (cl) {
-    //       cl_found = 1;
-    //       target = atoi(cl + 16);
-    //       //Get HEADER length
-    //       char* end_head = strstr(buf, "\r\n\r\n");
-    //       *end_head = 0;
-    //       header_length = strlen(buf) + 4;
-    //       *end_head = '\r';
-    //       target += header_length;
-    //     }
-    //   }
-    //   bytes_read += n;
-    // }
-    // while (n > 0 && target > bytes_read);
-  
-    // if (n < 0) {
-    //   error("ERROR reading from socket");
-    //   return 0;
-    // }
-    // char* object = malloc(bytes_read);
-    // memcpy(object, buf, bytes_read);
-    // int max_age;
-    // char* time_left = strstr(buf, "Cache-Control: max-age=");
-    // int start_time = time(NULL);
-    // int bytes_len = bytes_read;
-    // *bytes = bytes_read;
-    // if (time_left) {
-    //   max_age = atoi(time_left + 23) + start_time;
-    // }
-    // else {
-    //   max_age = 3600 + start_time;
-    // }
-    
-    // update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
-    // printf("Echo from server: %s\n", buf);
-    // close(sockfd);
-    // return 1;
 }
 
 void initialize_cache(entry* cache) {
