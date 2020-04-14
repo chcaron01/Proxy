@@ -109,20 +109,6 @@ int main(int argc, char **argv) {
   FD_ZERO (&active_fd_set);
   FD_SET (parentfd, &active_fd_set);
 
-    int bytes_read = 0;
-    int status = check_cache(buf, cache, lru, &filled, &bytes_read, childfd);
-    if (status == -2) {
-      continue;
-    }
-    else if (status != -1) {
-      status = send_to_server(buf, cache, lru, status, &bytes_read);
-    }
-    
-    if (status) {
-      n = write(childfd, buf, bytes_read);
-      if (n < 0) 
-        error("ERROR writing to socket");
-
   clientlen = sizeof(clientname);
   while (1) {
     read_fd_set = active_fd_set;
@@ -165,8 +151,12 @@ int main(int argc, char **argv) {
                   error("ERROR reading from socket");
                 printf("server received %d bytes: %s", n, buf);
                 int bytes_read = 0;
-                int status = check_cache(buf, cache, lru, &filled, &bytes_read);
-                if (status != -1) {
+                int status = check_cache(buf, cache, lru, &filled, &bytes_read, i);
+                if (status == -2) {
+                  FD_CLR (i, &active_fd_set);
+                  continue;
+                }
+                else if (status != -1) {
                   status = send_to_server(buf, cache, lru, status, &bytes_read);
                 }
                 
@@ -451,21 +441,21 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
 
     printf("Okay response sent to client\n");
 
-    fd_set active_fd_set, read_fd_set;
+    fd_set active_fd_set_connect, read_fd_set_connect;
 
-    FD_ZERO (&active_fd_set);
-    FD_SET (clientfd, &active_fd_set);
-    FD_SET (serverfd, &active_fd_set);
+    FD_ZERO (&active_fd_set_connect);
+    FD_SET (clientfd, &active_fd_set_connect);
+    FD_SET (serverfd, &active_fd_set_connect);
     while (1) {
-      read_fd_set = active_fd_set;
-      int select_val = select (FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
+      read_fd_set_connect = active_fd_set_connect;
+      int select_val = select (FD_SETSIZE, &read_fd_set_connect, NULL, NULL, NULL);
       if (select_val < 0) {
         perror ("select");
         exit (EXIT_FAILURE);
       }
 
       for (int i = 0; i < FD_SETSIZE; ++i) {
-        if (FD_ISSET (i, &read_fd_set)) {
+        if (FD_ISSET (i, &read_fd_set_connect)) {
           printf("Reading on socket %d\n", i);
           int readfd;
           int writefd;
