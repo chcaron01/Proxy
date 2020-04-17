@@ -446,6 +446,8 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     FD_ZERO (&active_fd_set_connect);
     FD_SET (clientfd, &active_fd_set_connect);
     FD_SET (serverfd, &active_fd_set_connect);
+    char sni[30];
+    memset(sni, 0, 30);
     while (1) {
       read_fd_set_connect = active_fd_set_connect;
       int select_val = select (FD_SETSIZE, &read_fd_set_connect, NULL, NULL, NULL);
@@ -475,6 +477,7 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
           bzero(buf, BUFSIZE);
           n = read(readfd, buf, BUFSIZE);
           printf("Read %d bytes\n", n);
+        
           if (n < 0) {
             error("ERROR reading for tunnel");
             close(writefd);
@@ -484,6 +487,33 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
             close(readfd);
             close(writefd);
             return 1;
+          }
+
+          if (i == clientfd) {
+            if (buf[0] == 22) {
+              unsigned short totalLen = (buf[3] << 8) | buf[4];
+              int lenSoFar = 0;
+              if (buf[5] == 1) {
+                unsigned char sessIdLen = buf[43];
+                lenSoFar += sessIdLen + 43 + 1;
+                unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
+                lenSoFar += cipherLen + 2;
+                unsigned char compressLen = buf[lenSoFar];
+                lenSoFar += compressLen + 1;
+                unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
+                lenSoFar += 2;
+                while (lenSoFar < totalLen) {
+                  if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
+                    if (buf[lenSoFar + 6] == 0) {
+                      memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
+                      printf("SNI: %s\n", sni);
+                      break;
+                    }
+                  }
+                  lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
+                }
+              }
+            }
           }
 
           n = write(writefd, buf, n);
