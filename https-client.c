@@ -1,4 +1,6 @@
 // Ryan Megathlin
+// to compile: gcc -o client  https-client.c -L/usr/lib -lssl -lcrypto
+// Should generate one warning (and some "skipping incompatible" messages), which can be ignored
 
 #include <stdio.h>
 #include <unistd.h>
