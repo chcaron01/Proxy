@@ -21,7 +21,7 @@ EVP_PKEY * generate_key() {
     }
     
     /* Generate the RSA key and assign it to pkey. */
-    FILE *fp = fopen("./fakeCA.key", "r");
+    FILE *fp = fopen("./EMEN.key", "r");
     RSA * rsa = PEM_read_RSAPrivateKey(fp, NULL, NULL, "elephantmen");
     if(!EVP_PKEY_assign_RSA(pkey, rsa))
     {
@@ -131,13 +131,18 @@ SSL_CTX *create_context()
     return ctx;
 }
 
-void configure_context(SSL_CTX *ctx, X509 * cert)
+void configure_context(SSL_CTX *ctx, X509 * cert, EVP_PKEY *pkey)
 {
     SSL_CTX_set_ecdh_auto(ctx, 1);
     SSL_CTX_set_cipher_list(ctx, "ALL");
 
     /* Set the key and cert */
     if (SSL_CTX_use_certificate(ctx, cert) <= 0) {
+        ERR_print_errors_fp(stderr);
+    exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey(ctx, pkey) <= 0) {
         ERR_print_errors_fp(stderr);
     exit(EXIT_FAILURE);
     }
@@ -153,7 +158,7 @@ int main(int argc, char **argv)
 
     EVP_PKEY * pkey = generate_key();
     X509 * cert = generate_x509(pkey, "google.com");
-    configure_context(ctx, cert);
+    configure_context(ctx, cert, pkey);
 
     sock = create_socket(9000);
     int optval = 1;
@@ -176,10 +181,24 @@ int main(int argc, char **argv)
         ssl = SSL_new(ctx);
         SSL_set_fd(ssl, client);
 
+        char ignore[100000];
+        int n = read(client, ignore, 100000);
+        if (n < 0) {
+          printf("ERROR reading from client");
+          return -1;
+        }
+
+        // Report to the client that connection was successful
+        char* okay_response = "HTTP/1.1 200 OK\r\n\r\n";
+
+        n = write(client, okay_response, strlen(okay_response));
+        if (n < 0) {
+          printf("ERROR writing to client");
+          return -1;
+        }
+
         if (SSL_accept(ssl) <= 0) {
-            STACK_OF(SSL_CIPHER) *ciphers = SSL_get_ciphers(ssl);
-            printf("%s\n", (char*) ciphers);
-            printf("%d\n", strlen((char*)ciphers));
+            printf("IT FAILED\n");
             ERR_print_errors_fp(stderr);
         }
         else {
