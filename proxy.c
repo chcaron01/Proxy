@@ -10,9 +10,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <stdbool.h>
 
 #define BUFSIZE 10000000
 #define ENTRIES 10
+#define MAX_HTTPS_CLIENTS 20
 
 typedef struct {
   char * key;
@@ -21,6 +23,17 @@ typedef struct {
   int start_time;
   int bytes_len;
 } entry;
+
+typedef struct item
+{
+    int key;
+    int fwdfd;
+    int is_started;
+} item;
+
+const item NULL_ITEM = { .key = -1,
+                         .fwdfd = -1,
+                         .is_started = false };
 
 int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes_read);
 // Initializes values in each cache entry to NULL or 0
@@ -42,11 +55,15 @@ int find_entry(entry* cache, char* key);
 // Handles each input line. For PUT: creates key, object, max-age buffers. Check if key exists. Check if cache is filled.
 // Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
-
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, int childfd);
-
-// Called to handle a connect request and subsequent transmission
-int connect_protocol(char* buf, int bytes_read, int clientfd);
+// Called to handle a connect request. Does not handle the tunneling, only sets it up
+int connect_init(char* buf, int clientfd);
+// Removes an item from the fd_lookup and handles closing the fd
+void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_set);
+// Inserts an item into the fd_lookup
+int insert_item(item in_item, item* fd_lookup);
+// Finds an item in the fd_lookup
+item* find_item(int key, item* fd_lookup);
 
 void error(char *msg) {
   perror(msg);
@@ -77,6 +94,14 @@ int main(int argc, char **argv) {
   int* lru = (int*)malloc(sizeof(int) * ENTRIES);
   initialize_lru(lru);
   int filled = 0;
+
+  // Initializing lookup
+  item* fd_lookup = malloc(sizeof(*fd_lookup) * 2*MAX_HTTPS_CLIENTS);
+  for (int i = 0; i < 2*MAX_HTTPS_CLIENTS; i++) {
+    item insert;
+    insert.key = -1;
+    fd_lookup[i] = insert;
+  }
 
   parentfd = socket(AF_INET, SOCK_STREAM, 0);
   if (parentfd < 0) 
@@ -119,56 +144,155 @@ int main(int argc, char **argv) {
         exit (EXIT_FAILURE);
       }
     for (i = 0; i < FD_SETSIZE; ++i) {
-        if (FD_ISSET (i, &read_fd_set)) {
-            if (i == parentfd) {
-              int new;
-              new = accept (parentfd, (struct sockaddr *) &clientname,(socklen_t *) &clientlen);
-              if (new < 0)
-                  {
-                    perror ("accept");
-                    exit (EXIT_FAILURE);
-                  }
-                fprintf (stderr,
-                         "Server: connect from host %s, port %hd.\n",
-                         inet_ntoa (clientname.sin_addr),
-                         ntohs (clientname.sin_port));
-                FD_SET (new, &active_fd_set);
+      if (FD_ISSET (i, &read_fd_set)) {
+        if (i == parentfd) {
+          int new;
+          new = accept (parentfd, (struct sockaddr *) &clientname,(socklen_t *) &clientlen);
+          if (new < 0)
+              {
+                perror ("accept");
+                exit (EXIT_FAILURE);
+              }
+            fprintf (stderr,
+                     "Server: connect from host %s, port %hd.\n",
+                     inet_ntoa (clientname.sin_addr),
+                     ntohs (clientname.sin_port));
+            FD_SET (new, &active_fd_set);
+        }
+        else {
+          item* cur_item = find_item(i, fd_lookup);
+          if (cur_item->key == -1) {
+            hostp = gethostbyaddr((const char *)&clientname.sin_addr.s_addr, 
+                                  sizeof(clientname.sin_addr.s_addr), AF_INET);
+            if (hostp == NULL)
+              error("ERROR on gethostbyaddr");
+            hostaddrp = inet_ntoa(clientname.sin_addr);
+            if (hostaddrp == NULL)
+              error("ERROR on inet_ntoa\n");
+
+            printf("server established connection with %s (%s)\n", hostp->h_name, hostaddrp);
+
+            bzero(buf, BUFSIZE);
+            n = read(i, buf, BUFSIZE);
+            if (n < 0) 
+              error("ERROR reading from socket");
+            printf("server received %d bytes: %s", n, buf);
+            int bytes_read = 0;
+            // NEEDS WORK: Assumes only explicit CONNECT or GET requests get here. Valid?
+
+            // Checking if the received message is a CONNECT or GET request
+            char* method = buf;
+            char* end_method = strstr(buf, " ");
+            *end_method = 0;
+            if (strcmp(method, "CONNECT") == 0) {
+              printf("Connect method received\n");
+              *end_method = ' ';
+              int serverfd = connect_init(buf, i);
+              // Insert the fds into the https array
+              item new_client, new_server;
+              new_client.key = i;
+              new_client.fwdfd = serverfd;
+              new_client.is_started = false;
+              if (!insert_item(new_client, fd_lookup))
+                error("No room for additional clients");
+              new_server.key = serverfd;
+              new_server.fwdfd = i;
+              new_server.is_started = false;
+              if (!insert_item(new_server, fd_lookup))
+                error("ERROR inserting client into the list");
+
+              FD_SET (i, &active_fd_set);
+              FD_SET (serverfd, &active_fd_set);
+              // NEEDS WORK: How am I handling a failed CONNECT?
+            }
+            else if (strcmp(method, "GET") == 0) {
+              printf("Get method received\n");
+              *end_method = ' ';
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read, i);
+              if (status == -2) {
+                FD_CLR (i, &active_fd_set);
+                continue;
+              }
+              else if (status != -1)
+                status = send_to_server(buf, cache, lru, status, &bytes_read);
+              
+              if (status)
+                n = write(i, buf, bytes_read);
+
+              if (n < 0) 
+                error("ERROR writing to socket");
+              
+              close(i); // QUESTION: Do we need to close i?
+              FD_CLR (i, &active_fd_set);
             }
             else {
-                hostp = gethostbyaddr((const char *)&clientname.sin_addr.s_addr, 
-                          sizeof(clientname.sin_addr.s_addr), AF_INET);
-                if (hostp == NULL)
-                  error("ERROR on gethostbyaddr");
-                hostaddrp = inet_ntoa(clientname.sin_addr);
-                if (hostaddrp == NULL)
-                  error("ERROR on inet_ntoa\n");
-                printf("server established connection with %s (%s)\n", 
-                   hostp->h_name, hostaddrp);
-                
-                bzero(buf, BUFSIZE);
-                n = read(i, buf, BUFSIZE);
-                if (n < 0) 
-                  error("ERROR reading from socket");
-                printf("server received %d bytes: %s", n, buf);
-                int bytes_read = 0;
-                int status = check_cache(buf, cache, lru, &filled, &bytes_read, i);
-                if (status == -2) {
-                  FD_CLR (i, &active_fd_set);
-                  continue;
-                }
-                else if (status != -1) {
-                  status = send_to_server(buf, cache, lru, status, &bytes_read);
-                }
-                
-                if (status) {
-                  n = write(i, buf, bytes_read);
-                  if (n < 0) 
-                    error("ERROR writing to socket");
-                }
-                close(i);
-                FD_CLR (i, &active_fd_set);
+              // NEEDS WORK: Better error message or handle as valid
+              error("Non-GET/CONNECT request... Is this unexpected?\n");
             }
+          }
+          else { // is https
+            printf("Reading on socket %d\n", i);
+            bzero(buf, BUFSIZE);
+            n = read(cur_item->key, buf, BUFSIZE);
+            printf("Read %d bytes\n", n);
+            if (n < 0) {
+              error("ERROR reading for tunnel");
+              remove_item(cur_item, fd_lookup, &active_fd_set);
+              continue;
+            }
+            else if (n == 0) {
+              remove_item(cur_item, fd_lookup, &active_fd_set);
+              continue;
+            }
+
+            if (cur_item->is_started) {
+              printf("In tunnel: writing to fd %d\n", cur_item->fwdfd);
+              n = write(cur_item->fwdfd, buf, n);
+              if (n < 0) {
+                error("ERROR writing for tunnel");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                return 0;
+              }
+            }
+            else {
+              char sni[30];
+              memset(sni, 0, 30);
+              if (buf[0] == 22) {
+                unsigned short totalLen = (buf[3] << 8) | buf[4];
+                int lenSoFar = 0;
+                if (buf[5] == 1) {
+                  unsigned char sessIdLen = buf[43];
+                  lenSoFar += sessIdLen + 43 + 1;
+                  unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
+                  lenSoFar += cipherLen + 2;
+                  unsigned char compressLen = buf[lenSoFar];
+                  lenSoFar += compressLen + 1;
+                  unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
+                  lenSoFar += 2;
+                  while (lenSoFar < totalLen) {
+                    if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
+                      if (buf[lenSoFar + 6] == 0) {
+                        memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
+                        printf("SNI: %s\n", sni);
+                        break;
+                      }
+                    }
+                    lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
+                  }
+                }
+                n = write(cur_item->fwdfd, buf, n);
+                if (n < 0) {
+                  error("ERROR writing for tunnel");
+                  remove_item(cur_item, fd_lookup, &active_fd_set);
+                  return 0;
+                }
+
+                cur_item->is_started = true;
+              }
+            }
+          }
         }
+      }
     }
   }
 }
@@ -290,26 +414,6 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, int clientfd) {
 
-  char* method = buf;
-  char* end_method = strstr(buf, " ");
-  *end_method = 0;
-  if (strcmp(method, "CONNECT") == 0) {
-    *end_method = ' ';
-    printf("Connect method received\n");
-    int result = connect_protocol(buf, *bytes_read, clientfd);
-    if (!result)
-      error("Connect method failed");
-    printf("Connect completed\n");
-    return -2;
-  }
-  else if (strcmp(method, "GET") != 0) {
-    return -1;
-  }
-
-  printf("Get method received\n");
-
-  *end_method = ' ';
-
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -338,7 +442,6 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
       return key_exists;
     }
     else {
-      // What is happening here?
       bzero(buf, BUFSIZE);
       char age[10];
       sprintf(age, "%d", time(NULL) - cache[key_exists].start_time);
@@ -374,7 +477,7 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
   }
 }
 
-int connect_protocol(char* buf, int bytes_read, int clientfd) {
+int connect_init(char* buf, int clientfd) {
     int serverfd, portno, n;
     struct sockaddr_in serveraddr;
     struct hostent *server;
@@ -391,17 +494,16 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     if (port) {
       portno = atoi(port);
       *end_port = ' ';
-      server = gethostbyname(hostname);
     }
     else {
       portno = 443; // HTTPS port
-      server = gethostbyname(hostname);
     }
+    server = gethostbyname(hostname);
   
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
-        return 0;
+        return -1;
     }
 
     *end_host = ':';
@@ -412,7 +514,7 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     serverfd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverfd < 0) {
         error("ERROR opening socket");
-        return 0;
+        return -1;
     }
 
     /* build the server's Internet address */
@@ -425,7 +527,7 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     /* connect: create a connection with the server */
     if (connect(serverfd, (struct sockaddr *) &serveraddr, sizeof(serveraddr)) < 0) {
       error("ERROR connecting");
-      return 0;
+      return -1;
     }
 
     printf("Connected to requested server\n");
@@ -436,95 +538,41 @@ int connect_protocol(char* buf, int bytes_read, int clientfd) {
     n = write(clientfd, okay_response, strlen(okay_response));
     if (n < 0) {
       error("ERROR writing to client");
-      return 0;
+      return -1;
     }
 
     printf("Okay response sent to client\n");
 
-    fd_set active_fd_set_connect, read_fd_set_connect;
+    return serverfd;
+}
 
-    FD_ZERO (&active_fd_set_connect);
-    FD_SET (clientfd, &active_fd_set_connect);
-    FD_SET (serverfd, &active_fd_set_connect);
-    char sni[30];
-    memset(sni, 0, 30);
-    while (1) {
-      read_fd_set_connect = active_fd_set_connect;
-      int select_val = select (FD_SETSIZE, &read_fd_set_connect, NULL, NULL, NULL);
-      if (select_val < 0) {
-        perror ("select");
-        exit (EXIT_FAILURE);
-      }
+void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
+  FD_CLR (cur_item->key, active_fd_p);
+  FD_CLR (cur_item->fwdfd, active_fd_p);
+  close(cur_item->key);
+  close(cur_item->fwdfd);
+  item* rem_item = find_item(cur_item->fwdfd, fd_lookup);
+  cur_item->key = -1;
+  rem_item->key = -1;
+}
 
-      for (int i = 0; i < FD_SETSIZE; ++i) {
-        if (FD_ISSET (i, &read_fd_set_connect)) {
-          printf("Reading on socket %d\n", i);
-          int readfd;
-          int writefd;
-          if (i == clientfd) {
-            readfd = clientfd;
-            writefd = serverfd;
-          }
-          else if (i == serverfd) {
-            readfd = serverfd;
-            writefd = clientfd;
-          }
-          else {
-            printf("ERROR Unexpected socket\n");
-            return 0;
-          }
-
-          bzero(buf, BUFSIZE);
-          n = read(readfd, buf, BUFSIZE);
-          printf("Read %d bytes\n", n);
-        
-          if (n < 0) {
-            error("ERROR reading for tunnel");
-            close(writefd);
-            return 0;
-          }
-          else if (n == 0) {
-            close(readfd);
-            close(writefd);
-            return 1;
-          }
-
-          if (i == clientfd) {
-            if (buf[0] == 22) {
-              unsigned short totalLen = (buf[3] << 8) | buf[4];
-              int lenSoFar = 0;
-              if (buf[5] == 1) {
-                unsigned char sessIdLen = buf[43];
-                lenSoFar += sessIdLen + 43 + 1;
-                unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
-                lenSoFar += cipherLen + 2;
-                unsigned char compressLen = buf[lenSoFar];
-                lenSoFar += compressLen + 1;
-                unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
-                lenSoFar += 2;
-                while (lenSoFar < totalLen) {
-                  if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
-                    if (buf[lenSoFar + 6] == 0) {
-                      memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
-                      printf("SNI: %s\n", sni);
-                      break;
-                    }
-                  }
-                  lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
-                }
-              }
-            }
-          }
-
-          n = write(writefd, buf, n);
-          if (n < 0) {
-            error("ERROR writing for tunnel");
-            close(readfd);
-            return 0;
-          }
-        }
-      }
+int insert_item(item in_item, item* fd_lookup) {
+  for (int i = 0; i < 2*MAX_HTTPS_CLIENTS; i++) {
+    if (fd_lookup[i].key == -1) {
+      fd_lookup[i] = in_item;
+      return 1;
     }
+  }
+  return 0;
+}
+
+item* find_item(int key, item* fd_lookup) {
+  for (int i = 0; i < 2*MAX_HTTPS_CLIENTS; i++) {
+    if (fd_lookup[i].key == key) {
+      return &fd_lookup[i];
+    }
+  }
+  return &NULL_ITEM;
 }
 
 void initialize_cache(entry* cache) {
