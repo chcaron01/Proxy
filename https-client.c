@@ -134,9 +134,9 @@ int CertsMod(SSL* ssl_client, SSL* ssl_server)
       return 1;
       // NEEDS WORK: Likely need more frees
     }
-    else
+    else {
       printf("Info: No client certificates configured.\n");
-
+    }
 
 }
 
@@ -207,10 +207,11 @@ void PrintCert(SSL* ssl) {
   }
 }
 
-SSL* SSLConnect(int sockfd) {
+SSL* SSLConnect(int sockfd, const char* SNI) {
   SSL_library_init(); //Possibly needs to be called outside function
   SSL_CTX* ctx = InitCTX();
   SSL* ssl = SSL_new(ctx);
+  SSL_set_tlsext_host_name(ssl, SNI);
   SSL_set_fd(ssl, sockfd);
   if (SSL_connect(ssl) == -1) {
     ERR_print_errors_fp(stderr);
@@ -224,14 +225,14 @@ SSL* SSLConnect(int sockfd) {
 int main(int argc, char **argv) {
   //char* buf = malloc(BUFSIZE);
 
-  char* hostname_google = "google.com";
+  char* hostname_google = "youtubekids.com";
   char* hostname_digicert = "digicert.com";
   int portno = 443;
 
   int googlefd = open_connection(hostname_google, portno);
   int digicertfd = open_connection(hostname_digicert, portno);
-  SSL* ssl_google = SSLConnect(googlefd);
-  SSL* ssl_digicert = SSLConnect(digicertfd);
+  SSL* ssl_google = SSLConnect(googlefd, hostname_google);
+  SSL* ssl_digicert = SSLConnect(digicertfd, hostname_digicert);
 
   printf("Google Connected with %s encryption\n\n", SSL_get_cipher(ssl_google));
   printf("Digicert Connected with %s encryption\n\n", SSL_get_cipher(ssl_digicert));
