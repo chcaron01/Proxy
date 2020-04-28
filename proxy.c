@@ -1,5 +1,8 @@
 /* Final Project -- Charlie Caron and Ryan Megathlin */
 
+// To compile on mac: gcc -I/usr/local/opt/openssl@1.1/include -L/usr/local/opt/openssl@1.1/lib -o proxy -g proxy.c -lssl -lcrypto
+// (Generates 2 warnings)
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -11,6 +14,16 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <stdbool.h>
+
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#include <openssl/conf.h>
+#include <openssl/x509v3.h>
+#include <openssl/asn1.h>
 
 #define BUFSIZE 10000000
 #define ENTRIES 10
@@ -28,12 +41,14 @@ typedef struct item
 {
     int key;
     int fwdfd;
-    int is_started;
+    SSL* ssl;
+    SSL* fwdssl;
 } item;
 
 const item NULL_ITEM = { .key = -1,
                          .fwdfd = -1,
-                         .is_started = false };
+                         .ssl = NULL,
+                         .fwdssl = NULL };
 
 int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes_read);
 // Initializes values in each cache entry to NULL or 0
@@ -53,17 +68,37 @@ void pushback_LRU(int* lru, int index);
 // Returns index if key is found in cache. Returns -1 if key not found
 int find_entry(entry* cache, char* key);
 // Handles each input line. For PUT: creates key, object, max-age buffers. Check if key exists. Check if cache is filled.
-// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
+// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value NEEDS WORK: Is this comment for check_cache()?
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, int childfd);
+// Checks the cache or something
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
 int connect_init(char* buf, int clientfd);
+// Creates the https connections to client and server. Inserts the SSL* structures into the items
+int https_init(item* client, item* server);
 // Removes an item from the fd_lookup and handles closing the fd
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_set);
 // Inserts an item into the fd_lookup
 int insert_item(item in_item, item* fd_lookup);
 // Finds an item in the fd_lookup
 item* find_item(int key, item* fd_lookup);
+// Currently unused function to get sni without OpenSSL
+char* get_sni(int fd);
+
+// SSL helper functions
+
+SSL_CTX* InitCTX();
+SSL* SSLServerConnect(int sockfd, const char* SNI);
+SSL_CTX *create_context();
+void configure_context(SSL_CTX *ctx);
+
+
+void init_openssl()
+{ 
+    SSL_load_error_strings();   
+    OpenSSL_add_ssl_algorithms();
+    OpenSSL_add_all_ciphers();
+}
 
 void error(char *msg) {
   perror(msg);
@@ -102,6 +137,8 @@ int main(int argc, char **argv) {
     insert.key = -1;
     fd_lookup[i] = insert;
   }
+
+  init_openssl();
 
   parentfd = socket(AF_INET, SOCK_STREAM, 0);
   if (parentfd < 0) 
@@ -161,7 +198,7 @@ int main(int argc, char **argv) {
         }
         else {
           item* cur_item = find_item(i, fd_lookup);
-          if (cur_item->key == -1) {
+          if (cur_item == NULL) { // Initial message from client
             hostp = gethostbyaddr((const char *)&clientname.sin_addr.s_addr, 
                                   sizeof(clientname.sin_addr.s_addr), AF_INET);
             if (hostp == NULL)
@@ -187,33 +224,34 @@ int main(int argc, char **argv) {
             if (strcmp(method, "CONNECT") == 0) {
               printf("Connect method received\n");
               *end_method = ' ';
-              int serverfd = connect_init(buf, i);
-              // Insert the fds into the https array
               item new_client, new_server;
+              int serverfd = connect_init(buf, i); // NEEDS WORK: client and server items input by reference
+              if (!serverfd) {
+                error("ERROR with initializing the HTTPS connections");
+              }
+              // Insert the fds into the https array
               new_client.key = i;
               new_client.fwdfd = serverfd;
-              new_client.is_started = false;
+              new_client.ssl = NULL;
+              new_client.fwdssl = NULL;
               if (!insert_item(new_client, fd_lookup))
                 error("No room for additional clients");
               new_server.key = serverfd;
               new_server.fwdfd = i;
-              new_server.is_started = false;
+              new_server.ssl = NULL;
+              new_server.fwdssl = NULL;
               if (!insert_item(new_server, fd_lookup))
-                error("ERROR inserting client into the list");
+                error("ERROR inserting client (server item) into the list");
 
               FD_SET (i, &active_fd_set);
               FD_SET (serverfd, &active_fd_set);
-              // NEEDS WORK: How am I handling a failed CONNECT?
+              // NEEDS WORK: How is a failed CONNECT handled?
             }
             else if (strcmp(method, "GET") == 0) {
               printf("Get method received\n");
               *end_method = ' ';
-              int status = check_cache(buf, cache, lru, &filled, &bytes_read, i);
-              if (status == -2) {
-                FD_CLR (i, &active_fd_set);
-                continue;
-              }
-              else if (status != -1)
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+              if (status != -1)
                 status = send_to_server(buf, cache, lru, status, &bytes_read);
               
               if (status)
@@ -226,70 +264,91 @@ int main(int argc, char **argv) {
               FD_CLR (i, &active_fd_set);
             }
             else {
-              // NEEDS WORK: Better error message or handle as valid
-              error("Non-GET/CONNECT request... Is this unexpected?\n");
+              error("ERROR received unrecognized message method. Message was not forwarded");
             }
           }
-          else { // is https
-            printf("Reading on socket %d\n", i);
+          else if (cur_item->ssl != NULL) { // is https, connection set
+            printf("Reading on socket %d\n", cur_item->key);
             bzero(buf, BUFSIZE);
-            n = read(cur_item->key, buf, BUFSIZE);
-            printf("Read %d bytes\n", n);
+
+            n = SSL_read(cur_item->ssl, buf, BUFSIZE);
             if (n < 0) {
-              error("ERROR reading for tunnel");
+              error("ERROR reading HTTPS message");
               remove_item(cur_item, fd_lookup, &active_fd_set);
               continue;
             }
-            else if (n == 0) {
+            else if (n == 0) { // Connection is done
+              printf("Connection completed\n");
               remove_item(cur_item, fd_lookup, &active_fd_set);
               continue;
+            }
+            printf("Message read from socket\n");
+            printf("Message:\n%s\n", buf);
+
+            char* method = buf;
+            char* end_method = strstr(buf, " ");
+            int is_get = 0;
+            if (end_method != NULL) {
+              *end_method = 0;
+              if (strcmp(method, "GET") == 0) {
+                is_get = 1;
+              }
+              *end_method = ' ';
             }
 
-            if (cur_item->is_started) {
-              printf("In tunnel: writing to fd %d\n", cur_item->fwdfd);
-              n = write(cur_item->fwdfd, buf, n);
-              if (n < 0) {
-                error("ERROR writing for tunnel");
-                remove_item(cur_item, fd_lookup, &active_fd_set);
-                return 0;
-              }
-            }
-            else {
-              char sni[30];
-              memset(sni, 0, 30);
-              if (buf[0] == 22) {
-                unsigned short totalLen = (buf[3] << 8) | buf[4];
-                int lenSoFar = 0;
-                if (buf[5] == 1) {
-                  unsigned char sessIdLen = buf[43];
-                  lenSoFar += sessIdLen + 43 + 1;
-                  unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
-                  lenSoFar += cipherLen + 2;
-                  unsigned char compressLen = buf[lenSoFar];
-                  lenSoFar += compressLen + 1;
-                  unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
-                  lenSoFar += 2;
-                  while (lenSoFar < totalLen) {
-                    if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
-                      if (buf[lenSoFar + 6] == 0) {
-                        memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
-                        printf("SNI: %s\n", sni);
-                        break;
-                      }
-                    }
-                    lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
-                  }
-                }
-                n = write(cur_item->fwdfd, buf, n);
+            printf("Entering if\n");
+            if (is_get) {
+              printf("Message is a GET request\n");
+              int bytes_read = 0;
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+              printf("Cache has been checked...");
+              if (status != -1) { // GET request was not found in the cache
+                printf("Request not found\n");
+                n = SSL_write(cur_item->fwdssl, buf, n); // NEEDS WORK: Needs cache insert
                 if (n < 0) {
-                  error("ERROR writing for tunnel");
+                  error("ERROR writing HTTPS message");
                   remove_item(cur_item, fd_lookup, &active_fd_set);
-                  return 0;
+                  continue;
                 }
-
-                cur_item->is_started = true;
+              }
+              else { // GET request was found in cache
+                printf("Request was found\n");
+                n = SSL_write(cur_item->ssl, buf, bytes_read);
+                if (n < 0) {
+                  error("ERROR writing HTTPS message");
+                  remove_item(cur_item, fd_lookup, &active_fd_set);
+                  continue;
+                }
               }
             }
+            else { // either server HTTPS response or different type of HTTP method
+              printf("Forwarding https message...\n");
+              n = SSL_write(cur_item->fwdssl, buf, n);
+              printf("On the other side\n");
+              if (n < 0) {
+                error("ERROR writing HTTPS message");
+                printf("See ya\n");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                continue;
+              }
+              printf("Successfully forwarded https message\n");
+            }
+          }
+          else { // is https but has not been initialized
+            printf("Setting up https connection...");
+            item* server_item = find_item(cur_item->fwdfd, fd_lookup);
+            if (server_item == NULL) {
+              error("ERROR server item not found in the data structure");
+              remove_item(cur_item, fd_lookup, &active_fd_set);
+              continue;
+            }
+            int succ = https_init(cur_item, server_item);
+            if (!succ) {
+              error("ERROR initializing the https connections");
+              remove_item(cur_item, fd_lookup, &active_fd_set);
+              continue;
+            }
+            printf("Complete\n");
           }
         }
       }
@@ -412,8 +471,8 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     return 1;
 }
 
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, int clientfd) {
-
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read) {
+  printf("In check_cache\n");
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -421,6 +480,9 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
 
   /* String parsing gets directory after hostname */
   char* first_line = strstr(buf, hostname);
+  if (first_line == hostname) {
+    first_line = strstr(buf, " ");
+  }
   char* directory = strstr(first_line, "/");
   char* end_dir = strstr(first_line, " ");
   *end_dir = 0;
@@ -431,8 +493,9 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
   // Return back to original
   *end_host = '\r';
   *end_dir = ' ';
-
+  printf("Searching for entry...");
   int key_exists = find_entry(cache, key);
+  printf("Entry searched for\n");
 
   free(key);
   int dead_time = find_dead_times(cache);
@@ -444,7 +507,7 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
     else {
       bzero(buf, BUFSIZE);
       char age[10];
-      sprintf(age, "%d", time(NULL) - cache[key_exists].start_time);
+      sprintf(age, "%ld", time(NULL) - cache[key_exists].start_time);
       char age_header[17];
       strcpy(age_header, "Age: ");
       strcat(age_header, age);
@@ -546,14 +609,56 @@ int connect_init(char* buf, int clientfd) {
     return serverfd;
 }
 
+int https_init(item* client, item* server) {
+  // NEEDS WORK: validate all steps of process, return 0 on failure
+  SSL_CTX *ctx = create_context();
+  configure_context(ctx);
+  client->ssl = SSL_new(ctx);
+  SSL_set_fd(client->ssl, client->key);
+  if (SSL_accept(client->ssl) <= 0) {
+    error("ERROR unable to complete the TLS handshake with client");
+    ERR_print_errors_fp(stderr);
+    return 0;
+  }
+
+  server->ssl = SSLServerConnect(server->key, NULL);
+  if (server->ssl == NULL) {
+    error("ERROR unable to complete the TLS handshake with server");
+    return 0;
+  }
+
+  client->fwdssl = server->ssl;
+  server->fwdssl = client->ssl;
+  return 1;
+}
+// NEEDS WORK: must confirm assumption that remove_item is never called on an incomplete item
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
-  FD_CLR (cur_item->key, active_fd_p);
-  FD_CLR (cur_item->fwdfd, active_fd_p);
-  close(cur_item->key);
-  close(cur_item->fwdfd);
-  item* rem_item = find_item(cur_item->fwdfd, fd_lookup);
-  cur_item->key = -1;
-  rem_item->key = -1;
+  printf("Remove item has been called\n");
+  if (cur_item->ssl != NULL) {
+    SSL_shutdown(cur_item->ssl);
+    SSL_free(cur_item->ssl);
+  }
+
+  if (cur_item->fwdssl != NULL) {
+    SSL_shutdown(cur_item->fwdssl);
+    SSL_free(cur_item->fwdssl);
+  }
+
+  if (cur_item->key != -1) {
+    FD_CLR (cur_item->key, active_fd_p);
+    close(cur_item->key);
+  }
+
+  if (cur_item->fwdfd != -1) {
+    FD_CLR (cur_item->fwdfd, active_fd_p);
+    close(cur_item->fwdfd);
+    item* rem_item = find_item(cur_item->fwdfd, fd_lookup);
+    if (rem_item != NULL) {
+      *rem_item = NULL_ITEM;
+    }
+  }
+  *cur_item = NULL_ITEM;
+  printf("Remove item returning\n");
 }
 
 int insert_item(item in_item, item* fd_lookup) {
@@ -572,7 +677,7 @@ item* find_item(int key, item* fd_lookup) {
       return &fd_lookup[i];
     }
   }
-  return &NULL_ITEM;
+  return NULL;
 }
 
 void initialize_cache(entry* cache) {
@@ -644,3 +749,127 @@ int find_entry(entry* cache, char* key) {
   }
   return -1;
 }
+
+// SSL helper functions
+
+SSL_CTX* InitCTX(void)
+{
+    SSL_METHOD* method;
+    SSL_CTX* ctx;
+    OpenSSL_add_all_algorithms();  /* Load cryptos, et.al. */
+    SSL_load_error_strings();   /* Bring in and register error messages */
+    method = TLSv1_2_client_method();  /* Create new client-method instance */
+    ctx = SSL_CTX_new(method);   /* Create new context */
+    if ( ctx == NULL )
+    {
+        ERR_print_errors_fp(stderr);
+        abort();
+    }
+    return ctx;
+}
+
+SSL* SSLServerConnect(int sockfd, const char* SNI) {
+  (void)SNI;
+  // NEEDS WORK: We need to validate the server certificate, because the client doesn't get to
+  SSL_CTX* ctx = InitCTX();
+  SSL* ssl = SSL_new(ctx);
+  //SSL_set_tlsext_host_name(ssl, SNI);
+  SSL_set_fd(ssl, sockfd);
+  if (SSL_connect(ssl) == -1) {
+    ERR_print_errors_fp(stderr);
+    return NULL;
+  }
+  else {
+    return ssl;
+  }
+}
+
+SSL_CTX *create_context()
+{
+    const SSL_METHOD *method;
+    SSL_CTX *ctx;
+
+    method = SSLv23_server_method();
+
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+    perror("Unable to create SSL context");
+    ERR_print_errors_fp(stderr);
+    exit(EXIT_FAILURE);
+    }
+
+    return ctx;
+}
+
+void configure_context(SSL_CTX *ctx)
+{
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+    SSL_CTX_set_cipher_list(ctx, "ALL");
+
+    /* Set the key and cert */
+    if ( SSL_CTX_use_certificate_file(ctx, "root-cert/proxy-cert.pem", SSL_FILETYPE_PEM) <= 0 )
+    {
+        ERR_print_errors_fp(stderr);
+        abort();
+    }
+    /* set the private key from KeyFile (may be the same as CertFile) */
+    if ( SSL_CTX_use_PrivateKey_file(ctx, "root-cert/proxy.keys", SSL_FILETYPE_PEM) <= 0 )
+    {
+        ERR_print_errors_fp(stderr);
+        abort();
+    }
+    /* verify private key */
+    if ( !SSL_CTX_check_private_key(ctx) )
+    {
+        fprintf(stderr, "Private key does not match the public certificate\n");
+        abort();
+    }
+}
+
+// char* get_sni(int fd) {
+//   printf("Reading on socket %d\n", fd);
+//   char *buf = malloc(BUFSIZE);
+//   bzero(buf, BUFSIZE);
+//   int n = read(fd, buf, BUFSIZE);
+//   printf("Read %d bytes\n", n);
+//   if (n < 0) {
+//     error("ERROR reading for tunnel");
+//     return 0;
+//   }
+//   else if (n == 0) {
+//     return 0;
+//   }
+
+//   char sni[30];
+//   memset(sni, 0, 30);
+//   if (buf[0] == 22) {
+//     unsigned short totalLen = (buf[3] << 8) | buf[4];
+//     int lenSoFar = 0;
+//     if (buf[5] == 1) {
+//       unsigned char sessIdLen = buf[43];
+//       lenSoFar += sessIdLen + 43 + 1;
+//       unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
+//       lenSoFar += cipherLen + 2;
+//       unsigned char compressLen = buf[lenSoFar];
+//       lenSoFar += compressLen + 1;
+//       unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
+//       lenSoFar += 2;
+//       while (lenSoFar < totalLen) {
+//         if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
+//           if (buf[lenSoFar + 6] == 0) {
+//             memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
+//             printf("SNI: %s\n", sni);
+//             break;
+//           }
+//         }
+//         lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
+//       }
+//     }
+//     n = write(client->fwdfd, buf, n);
+//     if (n < 0) {
+//       error("ERROR writing for tunnel");
+//       return 0;
+//     }
+//   }
+//   free(buf);
+// }
