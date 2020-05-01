@@ -91,6 +91,7 @@ SSL_CTX* InitCTX();
 SSL* SSLServerConnect(int sockfd, const char* SNI);
 SSL_CTX *create_context();
 void configure_context(SSL_CTX *ctx);
+int cert_cb(SSL *ssl, void* x509);
 
 
 void init_openssl()
@@ -614,6 +615,7 @@ int https_init(item* client, item* server) {
   SSL_CTX *ctx = create_context();
   configure_context(ctx);
   client->ssl = SSL_new(ctx);
+  SSL_CTX_set_client_cert_cb(ctx, client_cert_cb);
   SSL_set_fd(client->ssl, client->key);
   if (SSL_accept(client->ssl) <= 0) {
     error("ERROR unable to complete the TLS handshake with client");
@@ -631,6 +633,13 @@ int https_init(item* client, item* server) {
   server->fwdssl = client->ssl;
   return 1;
 }
+
+int cert_cb(SSL *ssl, void* x509) {
+  error("hello");
+  printf("%s\n", SSL_get_servername(ssl, SSL_get_servername_type(ssl)));
+  return 1;
+}
+
 // NEEDS WORK: must confirm assumption that remove_item is never called on an incomplete item
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
   printf("Remove item has been called\n");
@@ -825,51 +834,3 @@ void configure_context(SSL_CTX *ctx)
         abort();
     }
 }
-
-// char* get_sni(int fd) {
-//   printf("Reading on socket %d\n", fd);
-//   char *buf = malloc(BUFSIZE);
-//   bzero(buf, BUFSIZE);
-//   int n = read(fd, buf, BUFSIZE);
-//   printf("Read %d bytes\n", n);
-//   if (n < 0) {
-//     error("ERROR reading for tunnel");
-//     return 0;
-//   }
-//   else if (n == 0) {
-//     return 0;
-//   }
-
-//   char sni[30];
-//   memset(sni, 0, 30);
-//   if (buf[0] == 22) {
-//     unsigned short totalLen = (buf[3] << 8) | buf[4];
-//     int lenSoFar = 0;
-//     if (buf[5] == 1) {
-//       unsigned char sessIdLen = buf[43];
-//       lenSoFar += sessIdLen + 43 + 1;
-//       unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
-//       lenSoFar += cipherLen + 2;
-//       unsigned char compressLen = buf[lenSoFar];
-//       lenSoFar += compressLen + 1;
-//       unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
-//       lenSoFar += 2;
-//       while (lenSoFar < totalLen) {
-//         if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
-//           if (buf[lenSoFar + 6] == 0) {
-//             memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
-//             printf("SNI: %s\n", sni);
-//             break;
-//           }
-//         }
-//         lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
-//       }
-//     }
-//     n = write(client->fwdfd, buf, n);
-//     if (n < 0) {
-//       error("ERROR writing for tunnel");
-//       return 0;
-//     }
-//   }
-//   free(buf);
-// }
