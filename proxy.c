@@ -92,6 +92,8 @@ SSL* SSLServerConnect(int sockfd, const char* SNI);
 SSL_CTX *create_context();
 void configure_context(SSL_CTX *ctx);
 int cert_cb(SSL *ssl, void* x509);
+EVP_PKEY * generate_key();
+X509 * generate_x509(EVP_PKEY * pkey, char * CN);
 
 
 void init_openssl()
@@ -613,19 +615,13 @@ int connect_init(char* buf, int clientfd) {
 int https_init(item* client, item* server) {
   // NEEDS WORK: validate all steps of process, return 0 on failure
   SSL_CTX *ctx = create_context();
-  configure_context(ctx);
+  //configure_context(ctx);
   client->ssl = SSL_new(ctx);
-  SSL_CTX_set_client_cert_cb(ctx, client_cert_cb);
+  SSL_set_cert_cb(client->ssl, cert_cb, server);
   SSL_set_fd(client->ssl, client->key);
   if (SSL_accept(client->ssl) <= 0) {
     error("ERROR unable to complete the TLS handshake with client");
     ERR_print_errors_fp(stderr);
-    return 0;
-  }
-
-  server->ssl = SSLServerConnect(server->key, NULL);
-  if (server->ssl == NULL) {
-    error("ERROR unable to complete the TLS handshake with server");
     return 0;
   }
 
@@ -634,9 +630,32 @@ int https_init(item* client, item* server) {
   return 1;
 }
 
-int cert_cb(SSL *ssl, void* x509) {
-  error("hello");
-  printf("%s\n", SSL_get_servername(ssl, SSL_get_servername_type(ssl)));
+int cert_cb(SSL *ssl, void* server) {
+  item* serverItem = (item*) server;
+  const char* sni =  SSL_get_servername(ssl, SSL_get_servername_type(ssl));
+  serverItem->ssl = SSLServerConnect(serverItem->key, sni);
+  if (serverItem->ssl == NULL) {
+    error("ERROR unable to complete the TLS handshake with server");
+    return 0;
+  }
+  X509* cert_server = SSL_get_peer_certificate(serverItem->ssl);
+  X509_NAME *subj_server = X509_get_subject_name(cert_server);
+  int pos_server = X509_NAME_get_index_by_NID(subj_server, NID_commonName, 0);
+  X509_NAME_ENTRY *e_server = X509_NAME_get_entry(subj_server, pos_server);
+  ASN1_STRING *x = X509_NAME_ENTRY_get_data(e_server);
+  char* cn = ASN1_STRING_data(x);
+  printf("\nCOMMON NAME:%s\n", cn);
+  EVP_PKEY * cert_key = generate_key();
+  X509* certificate = generate_x509(cert_key, cn);
+
+  if (!SSL_use_certificate(ssl, certificate)) {
+    printf("Inserting certificate failed\n");
+    exit(1);
+  }
+  if (!SSL_use_PrivateKey(ssl, cert_key)){
+    printf("Inserting key failed\n");
+    exit(1);
+  }
   return 1;
 }
 
@@ -763,7 +782,7 @@ int find_entry(entry* cache, char* key) {
 
 SSL_CTX* InitCTX(void)
 {
-    SSL_METHOD* method;
+    const SSL_METHOD* method;
     SSL_CTX* ctx;
     OpenSSL_add_all_algorithms();  /* Load cryptos, et.al. */
     SSL_load_error_strings();   /* Bring in and register error messages */
@@ -782,7 +801,7 @@ SSL* SSLServerConnect(int sockfd, const char* SNI) {
   // NEEDS WORK: We need to validate the server certificate, because the client doesn't get to
   SSL_CTX* ctx = InitCTX();
   SSL* ssl = SSL_new(ctx);
-  //SSL_set_tlsext_host_name(ssl, SNI);
+  SSL_set_tlsext_host_name(ssl, SNI);
   SSL_set_fd(ssl, sockfd);
   if (SSL_connect(ssl) == -1) {
     ERR_print_errors_fp(stderr);
@@ -833,4 +852,93 @@ void configure_context(SSL_CTX *ctx)
         fprintf(stderr, "Private key does not match the public certificate\n");
         abort();
     }
+}
+
+EVP_PKEY * generate_key() {
+    /* Allocate memory for the EVP_PKEY structure. */
+    EVP_PKEY * pkey = EVP_PKEY_new();
+    if(!pkey)
+    {
+        return NULL;
+    }
+    
+    /* Generate the RSA key and assign it to pkey. */
+    FILE *fp = fopen("./root-cert/private/EMEN.key", "r");
+    RSA * rsa = PEM_read_RSAPrivateKey(fp, NULL, NULL, "elephantmen");
+    if(!EVP_PKEY_assign_RSA(pkey, rsa))
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
+    
+    /* The key has been generated, return it. */
+    return pkey;
+}
+
+EVP_PKEY * get_CA() {
+  EVP_PKEY * pkey = EVP_PKEY_new();
+    if(!pkey)
+    {
+        return NULL;
+    }
+    
+    /* Generate the RSA key and assign it to pkey. */
+    FILE *fp = fopen("./authorityCerts/myCA.key", "r");
+    RSA * rsa = PEM_read_RSAPrivateKey(fp, NULL, NULL, "onedove");
+    if(!EVP_PKEY_assign_RSA(pkey, rsa))
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
+    
+    /* The key has been generated, return it. */
+    return pkey;
+}
+
+X509 * generate_x509(EVP_PKEY * pkey, char * CN) {
+    /* Allocate memory for the X509 structure. */
+    X509 * x509 = X509_new();
+    X509 * CAx509 = X509_new();
+    if(!x509)
+    {
+        return NULL;
+    }
+    
+    /* Set the serial number. */
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    
+    /* This certificate is valid from now until exactly one year from now. */
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);
+    
+    /* Set the public key for our certificate. */
+    X509_set_pubkey(x509, pkey);
+    
+    /* We want to copy the subject name to the issuer name. */
+    BIO *i = BIO_new(BIO_s_file());
+
+    if ((BIO_read_filename(i, "./authorityCerts/myCA.pem") <= 0) || ((CAx509 = PEM_read_bio_X509_AUX(i, NULL, NULL, NULL)) == NULL)) {
+        printf("%d\n", i);
+        return NULL;
+    }
+
+    X509_NAME * name = X509_get_subject_name(CAx509);
+    char* line = printf("NAME: %s\n", X509_NAME_oneline(name, 0, 0));
+    
+    /* Set the country code and common name. */
+    X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"CA",        -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O",  MBSTRING_ASC, (unsigned char *)"MyCompany", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *) CN, -1, -1, 0);
+    
+    /* Now set the issuer name. */
+    X509_set_issuer_name(x509, name);
+    
+    /* Actually sign the certificate with our key. */
+    if(!X509_sign(x509, get_CA(), EVP_sha1()))
+    {
+        X509_free(x509);
+        return NULL;
+    }
+    
+    return x509;
 }
