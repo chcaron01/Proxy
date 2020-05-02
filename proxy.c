@@ -72,6 +72,8 @@ int find_entry(entry* cache, char* key);
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Checks the cache or something
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
+
+void print_cache(entry* cache);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
 int connect_init(char* buf, int clientfd);
 // Creates the https connections to client and server. Inserts the SSL* structures into the items
@@ -229,7 +231,7 @@ int main(int argc, char **argv) {
               *end_method = ' ';
               item new_client, new_server;
               int serverfd = connect_init(buf, i); // NEEDS WORK: client and server items input by reference
-              if (!serverfd) {
+              if (!serverfd || serverfd == -1) {
                 error("ERROR with initializing the HTTPS connections");
               }
               // Insert the fds into the https array
@@ -255,12 +257,13 @@ int main(int argc, char **argv) {
               *end_method = ' ';
               int status = check_cache(buf, cache, lru, &filled, &bytes_read);
               if (status != -1)
+                printf("Buffer: %s\n", buf);
                 status = send_to_server(buf, cache, lru, status, &bytes_read);
               
               if (status)
                 n = write(i, buf, bytes_read);
 
-              if (n < 0) 
+              if (n <= 0) 
                 error("ERROR writing to socket");
               
               close(i); // QUESTION: Do we need to close i?
@@ -394,6 +397,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
+        printf("send_to_server\n");
         return 0;
     }
 
@@ -476,6 +480,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read) {
   printf("In check_cache\n");
+  print_cache(cache);
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -569,6 +574,7 @@ int connect_init(char* buf, int clientfd) {
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
+        printf("connect_init\n");
         return -1;
     }
 
@@ -639,24 +645,35 @@ int cert_cb(SSL *ssl, void* server) {
     return 0;
   }
   X509* cert_server = SSL_get_peer_certificate(serverItem->ssl);
-  X509_NAME *subj_server = X509_get_subject_name(cert_server);
-  int pos_server = X509_NAME_get_index_by_NID(subj_server, NID_commonName, 0);
-  X509_NAME_ENTRY *e_server = X509_NAME_get_entry(subj_server, pos_server);
-  ASN1_STRING *x = X509_NAME_ENTRY_get_data(e_server);
-  char* cn = ASN1_STRING_data(x);
-  printf("\nCOMMON NAME:%s\n", cn);
-  EVP_PKEY * cert_key = generate_key();
-  X509* certificate = generate_x509(cert_key, cn);
+  if (cert_server) {
+    X509_NAME *subj_server = X509_get_subject_name(cert_server);
+    int pos_server = X509_NAME_get_index_by_NID(subj_server, NID_commonName, 0);
+    printf("%d\n", pos_server);
+    if (pos_server == -1) {
+      printf("Client: No common name...? Common name not modified\n");
+      return 0;
+    }
+    else {
+      X509_NAME_ENTRY *e_server = X509_NAME_get_entry(subj_server, pos_server);
+      ASN1_STRING *x = X509_NAME_ENTRY_get_data(e_server);
+      char* cn = ASN1_STRING_data(x);
+      printf("\nCOMMON NAME:%s\n", cn);
+      EVP_PKEY * cert_key = generate_key();
+      X509* certificate = generate_x509(cert_key, cn);
 
-  if (!SSL_use_certificate(ssl, certificate)) {
-    printf("Inserting certificate failed\n");
-    exit(1);
+      if (!SSL_use_certificate(ssl, certificate)) {
+        printf("Inserting certificate failed\n");
+        exit(1);
+      }
+      if (!SSL_use_PrivateKey(ssl, cert_key)){
+        printf("Inserting key failed\n");
+        exit(1);
+      }
+      return 1;
+    }
   }
-  if (!SSL_use_PrivateKey(ssl, cert_key)){
-    printf("Inserting key failed\n");
-    exit(1);
-  }
-  return 1;
+  
+  return 0;
 }
 
 // NEEDS WORK: must confirm assumption that remove_item is never called on an incomplete item
@@ -918,12 +935,10 @@ X509 * generate_x509(EVP_PKEY * pkey, char * CN) {
     BIO *i = BIO_new(BIO_s_file());
 
     if ((BIO_read_filename(i, "./authorityCerts/myCA.pem") <= 0) || ((CAx509 = PEM_read_bio_X509_AUX(i, NULL, NULL, NULL)) == NULL)) {
-        printf("%d\n", i);
         return NULL;
     }
 
     X509_NAME * name = X509_get_subject_name(CAx509);
-    char* line = printf("NAME: %s\n", X509_NAME_oneline(name, 0, 0));
     
     /* Set the country code and common name. */
     X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"CA",        -1, -1, 0);
@@ -941,4 +956,12 @@ X509 * generate_x509(EVP_PKEY * pkey, char * CN) {
     }
     
     return x509;
+}
+
+void print_cache(entry* cache) {
+  for (int i = 0; i < ENTRIES; i++) {
+    if (cache[i].key) {
+      printf("CACHE ENTRY: %s\n", cache[i].key);
+    }
+  }
 }
