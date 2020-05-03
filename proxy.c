@@ -28,6 +28,7 @@
 #define BUFSIZE 10000000
 #define ENTRIES 10
 #define MAX_HTTPS_CLIENTS 20
+#define MAX_LINE 1000
 
 typedef struct {
   char * key;
@@ -41,12 +42,14 @@ typedef struct item
 {
     int key;
     int fwdfd;
+    char cache_key[MAX_LINE];
     SSL* ssl;
     SSL* fwdssl;
 } item;
 
 const item NULL_ITEM = { .key = -1,
                          .fwdfd = -1,
+                         .cache_key = 0,
                          .ssl = NULL,
                          .fwdssl = NULL };
 
@@ -68,10 +71,13 @@ void pushback_LRU(int* lru, int index);
 // Returns index if key is found in cache. Returns -1 if key not found
 int find_entry(entry* cache, char* key);
 // Handles each input line. For PUT: creates key, object, max-age buffers. Check if key exists. Check if cache is filled.
-// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value NEEDS WORK: Is this comment for check_cache()?
+void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
+// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Checks the cache or something
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key);
+// Reads all of https response and inserts it into the cache
+int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
 int connect_init(char* buf, int clientfd);
 // Creates the https connections to client and server. Inserts the SSL* structures into the items
@@ -135,6 +141,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 2*MAX_HTTPS_CLIENTS; i++) {
     item insert;
     insert.key = -1;
+    bzero(insert.cache_key, MAX_LINE);
     fd_lookup[i] = insert;
   }
 
@@ -211,11 +218,15 @@ int main(int argc, char **argv) {
 
             bzero(buf, BUFSIZE);
             n = read(i, buf, BUFSIZE);
-            if (n < 0) 
-              error("ERROR reading from socket");
+            if (n < 0) {
+              error("ERROR reading from socket on first message");
+              item it;
+              it.key = i;
+              remove_item(&it, fd_lookup, &active_fd_set);
+              continue;
+            }
             printf("server received %d bytes: %s", n, buf);
             int bytes_read = 0;
-            // NEEDS WORK: Assumes only explicit CONNECT or GET requests get here. Valid?
 
             // Checking if the received message is a CONNECT or GET request
             char* method = buf;
@@ -225,7 +236,7 @@ int main(int argc, char **argv) {
               printf("Connect method received\n");
               *end_method = ' ';
               item new_client, new_server;
-              int serverfd = connect_init(buf, i); // NEEDS WORK: client and server items input by reference
+              int serverfd = connect_init(buf, i);
               if (!serverfd) {
                 error("ERROR with initializing the HTTPS connections");
               }
@@ -250,7 +261,7 @@ int main(int argc, char **argv) {
             else if (strcmp(method, "GET") == 0) {
               printf("Get method received\n");
               *end_method = ' ';
-              int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read, NULL);
               if (status != -1)
                 status = send_to_server(buf, cache, lru, status, &bytes_read);
               
@@ -265,6 +276,7 @@ int main(int argc, char **argv) {
             }
             else {
               error("ERROR received unrecognized message method. Message was not forwarded");
+              // NEEDS WORK: Need free or anything?
             }
           }
           else if (cur_item->ssl != NULL) { // is https, connection set
@@ -288,28 +300,34 @@ int main(int argc, char **argv) {
             char* method = buf;
             char* end_method = strstr(buf, " ");
             int is_get = 0;
+            int is_response = 0;
             if (end_method != NULL) {
               *end_method = 0;
               if (strcmp(method, "GET") == 0) {
                 is_get = 1;
               }
+              if (strncmp(method, "HTTP/", 5) == 0) {
+                is_response = 1;
+              }
               *end_method = ' ';
             }
 
-            printf("Entering if\n");
             if (is_get) {
               printf("Message is a GET request\n");
               int bytes_read = 0;
-              int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+              char key[1000];
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read, key);
               printf("Cache has been checked...");
               if (status != -1) { // GET request was not found in the cache
                 printf("Request not found\n");
-                n = SSL_write(cur_item->fwdssl, buf, n); // NEEDS WORK: Needs cache insert
+                n = SSL_write(cur_item->fwdssl, buf, n);
                 if (n < 0) {
                   error("ERROR writing HTTPS message");
                   remove_item(cur_item, fd_lookup, &active_fd_set);
                   continue;
                 }
+                item* server_item = find_item(cur_item->fwdfd, fd_lookup);
+                strcpy(server_item->cache_key, key);
               }
               else { // GET request was found in cache
                 printf("Request was found\n");
@@ -321,13 +339,28 @@ int main(int argc, char **argv) {
                 }
               }
             }
-            else { // either server HTTPS response or different type of HTTP method
+            else if (is_response) { // HTTPS response
+              printf("Receiving https response...\n");
+              int bytes_read = 0;
+              int succ = receive_https_response(cur_item, buf, cache, lru, &filled, &bytes_read);
+              if (!succ) {
+                error("ERROR reading HTTPS response from server");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                continue;
+              }
+              n = SSL_write(cur_item->fwdssl, buf, bytes_read);
+              if (n < 0) {
+                error("ERROR writing HTTPS response to client");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                continue;
+              }
+              printf("Successfully cached and forwarded https response\n");
+            }
+            else { // a different type of HTTP method
               printf("Forwarding https message...\n");
               n = SSL_write(cur_item->fwdssl, buf, n);
-              printf("On the other side\n");
               if (n < 0) {
                 error("ERROR writing HTTPS message");
-                printf("See ya\n");
                 remove_item(cur_item, fd_lookup, &active_fd_set);
                 continue;
               }
@@ -354,6 +387,73 @@ int main(int argc, char **argv) {
       }
     }
   }
+}
+
+int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes) {
+  int bytes_read = 0; //NEEDS WORK: is strlen okay?
+  int target = 50000;
+  int header_length = 0;
+  int cl_found = 0;
+  int n = strlen(buf);
+  printf("Entering while loop with %d bytes read\n", n);
+  while (n > 0 && target > bytes_read) {
+    printf("Bytes read on previous iteration: %d\n", n);
+    // NEEDS WORK: Needs to implement Transfer-Encoding: chunked
+    if (!cl_found) {
+      //Get CONTENT length
+      char* cl = strstr(buf, "Content-Length: ");
+      if (cl) {
+        cl_found = 1;
+        target = atoi(cl + 16);
+        //Get HEADER length
+        char* end_head = strstr(buf, "\r\n\r\n");
+        *end_head = 0;
+        header_length = strlen(buf) + 4;
+        *end_head = '\r';
+        target += header_length;
+      }
+    }
+    bytes_read += n;
+    n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
+  }
+
+  if (n < 0) {
+    error("ERROR reading from socket for https response");
+    return 0;
+  }
+  char* object = malloc(bytes_read);
+  memcpy(object, buf, bytes_read);
+  int max_age;
+  char* time_left = strstr(buf, "Cache-Control: max-age=");
+  int start_time = time(NULL);
+  int bytes_len = bytes_read;
+  *bytes = bytes_read;
+  if (time_left) {
+    max_age = atoi(time_left + 23) + start_time;
+  }
+  else {
+    max_age = 3600 + start_time;
+  }
+
+  int rem_idx;
+  int dead_time = find_dead_times(cache);
+  // If cache is not filled
+  if (*filled < ENTRIES) {
+    (*filled)++;
+    rem_idx = *filled - 1;
+  }
+  // If an entry's time has expired
+  else if (dead_time != -1) {
+    rem_idx = dead_time;
+  }
+  // Return lru
+  else {
+    rem_idx = lru[0];
+  }
+
+  update_LRU(lru, cache, cur_item->cache_key, object, max_age, start_time, bytes_read, rem_idx);
+  printf("Echo from server: %s\n", buf);
+  return 1;
 }
 
 int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes){
@@ -387,7 +487,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     strncpy(key + strlen(hostname), directory, strlen(directory) + 1);
     *end_host = '\r';
     *end_dir = ' ';
-  
+
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
@@ -446,7 +546,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
       bytes_read += n;
     }
     while (n > 0 && target > bytes_read);
-  
+
     if (n < 0) {
       error("ERROR reading from socket");
       return 0;
@@ -464,15 +564,14 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     else {
       max_age = 3600 + start_time;
     }
-    
+
     update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
     printf("Echo from server: %s\n", buf);
     close(sockfd);
     return 1;
 }
 
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read) {
-  printf("In check_cache\n");
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -490,12 +589,12 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read)
   char* key = malloc(strlen(hostname) + strlen(directory) + 1);
   strncpy(key, hostname, strlen(hostname));
   strncpy(key + strlen(hostname), directory, strlen(directory) + 1);
+  if (ret_key != NULL)
+    strcpy(ret_key, key);
   // Return back to original
   *end_host = '\r';
   *end_dir = ' ';
-  printf("Searching for entry...");
   int key_exists = find_entry(cache, key);
-  printf("Entry searched for\n");
 
   free(key);
   int dead_time = find_dead_times(cache);
@@ -631,7 +730,7 @@ int https_init(item* client, item* server) {
   server->fwdssl = client->ssl;
   return 1;
 }
-// NEEDS WORK: must confirm assumption that remove_item is never called on an incomplete item
+
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
   printf("Remove item has been called\n");
   if (cur_item->ssl != NULL) {
