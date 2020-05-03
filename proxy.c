@@ -75,9 +75,14 @@ void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Checks the cache or something
+
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key);
 // Reads all of https response and inserts it into the cache
 int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes);
+
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
+
+void print_cache(entry* cache);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
 int connect_init(char* buf, int clientfd);
 // Creates the https connections to client and server. Inserts the SSL* structures into the items
@@ -97,6 +102,9 @@ SSL_CTX* InitCTX();
 SSL* SSLServerConnect(int sockfd, const char* SNI);
 SSL_CTX *create_context();
 void configure_context(SSL_CTX *ctx);
+int cert_cb(SSL *ssl, void* x509);
+EVP_PKEY * generate_key();
+X509 * generate_x509(EVP_PKEY * pkey, char * CN);
 
 
 void init_openssl()
@@ -236,8 +244,9 @@ int main(int argc, char **argv) {
               printf("Connect method received\n");
               *end_method = ' ';
               item new_client, new_server;
-              int serverfd = connect_init(buf, i);
-              if (!serverfd) {
+
+              int serverfd = connect_init(buf, i); // NEEDS WORK: client and server items input by reference
+              if (!serverfd || serverfd == -1) {
                 error("ERROR with initializing the HTTPS connections");
               }
               // Insert the fds into the https array
@@ -263,12 +272,13 @@ int main(int argc, char **argv) {
               *end_method = ' ';
               int status = check_cache(buf, cache, lru, &filled, &bytes_read, NULL);
               if (status != -1)
+                printf("Buffer: %s\n", buf);
                 status = send_to_server(buf, cache, lru, status, &bytes_read);
               
               if (status)
                 n = write(i, buf, bytes_read);
 
-              if (n < 0) 
+              if (n <= 0) 
                 error("ERROR writing to socket");
               
               close(i); // QUESTION: Do we need to close i?
@@ -491,6 +501,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
+        printf("send_to_server\n");
         return 0;
     }
 
@@ -572,6 +583,8 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 }
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
+  printf("In check_cache\n");
+  print_cache(cache);
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -665,6 +678,7 @@ int connect_init(char* buf, int clientfd) {
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
+        printf("connect_init\n");
         return -1;
     }
 
@@ -711,8 +725,9 @@ int connect_init(char* buf, int clientfd) {
 int https_init(item* client, item* server) {
   // NEEDS WORK: validate all steps of process, return 0 on failure
   SSL_CTX *ctx = create_context();
-  configure_context(ctx);
+  //configure_context(ctx);
   client->ssl = SSL_new(ctx);
+  SSL_set_cert_cb(client->ssl, cert_cb, server);
   SSL_set_fd(client->ssl, client->key);
   if (SSL_accept(client->ssl) <= 0) {
     error("ERROR unable to complete the TLS handshake with client");
@@ -720,15 +735,49 @@ int https_init(item* client, item* server) {
     return 0;
   }
 
-  server->ssl = SSLServerConnect(server->key, NULL);
-  if (server->ssl == NULL) {
-    error("ERROR unable to complete the TLS handshake with server");
-    return 0;
-  }
-
   client->fwdssl = server->ssl;
   server->fwdssl = client->ssl;
   return 1;
+}
+
+int cert_cb(SSL *ssl, void* server) {
+  item* serverItem = (item*) server;
+  const char* sni =  SSL_get_servername(ssl, SSL_get_servername_type(ssl));
+  serverItem->ssl = SSLServerConnect(serverItem->key, sni);
+  if (serverItem->ssl == NULL) {
+    error("ERROR unable to complete the TLS handshake with server");
+    return 0;
+  }
+  X509* cert_server = SSL_get_peer_certificate(serverItem->ssl);
+  if (cert_server) {
+    X509_NAME *subj_server = X509_get_subject_name(cert_server);
+    int pos_server = X509_NAME_get_index_by_NID(subj_server, NID_commonName, 0);
+    printf("%d\n", pos_server);
+    if (pos_server == -1) {
+      printf("Client: No common name...? Common name not modified\n");
+      return 0;
+    }
+    else {
+      X509_NAME_ENTRY *e_server = X509_NAME_get_entry(subj_server, pos_server);
+      ASN1_STRING *x = X509_NAME_ENTRY_get_data(e_server);
+      char* cn = ASN1_STRING_data(x);
+      printf("\nCOMMON NAME:%s\n", cn);
+      EVP_PKEY * cert_key = generate_key();
+      X509* certificate = generate_x509(cert_key, cn);
+
+      if (!SSL_use_certificate(ssl, certificate)) {
+        printf("Inserting certificate failed\n");
+        exit(1);
+      }
+      if (!SSL_use_PrivateKey(ssl, cert_key)){
+        printf("Inserting key failed\n");
+        exit(1);
+      }
+      return 1;
+    }
+  }
+  
+  return 0;
 }
 
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
@@ -853,7 +902,7 @@ int find_entry(entry* cache, char* key) {
 
 SSL_CTX* InitCTX(void)
 {
-    SSL_METHOD* method;
+    const SSL_METHOD* method;
     SSL_CTX* ctx;
     OpenSSL_add_all_algorithms();  /* Load cryptos, et.al. */
     SSL_load_error_strings();   /* Bring in and register error messages */
@@ -872,7 +921,7 @@ SSL* SSLServerConnect(int sockfd, const char* SNI) {
   // NEEDS WORK: We need to validate the server certificate, because the client doesn't get to
   SSL_CTX* ctx = InitCTX();
   SSL* ssl = SSL_new(ctx);
-  //SSL_set_tlsext_host_name(ssl, SNI);
+  SSL_set_tlsext_host_name(ssl, SNI);
   SSL_set_fd(ssl, sockfd);
   if (SSL_connect(ssl) == -1) {
     ERR_print_errors_fp(stderr);
@@ -925,50 +974,97 @@ void configure_context(SSL_CTX *ctx)
     }
 }
 
-// char* get_sni(int fd) {
-//   printf("Reading on socket %d\n", fd);
-//   char *buf = malloc(BUFSIZE);
-//   bzero(buf, BUFSIZE);
-//   int n = read(fd, buf, BUFSIZE);
-//   printf("Read %d bytes\n", n);
-//   if (n < 0) {
-//     error("ERROR reading for tunnel");
-//     return 0;
-//   }
-//   else if (n == 0) {
-//     return 0;
-//   }
+EVP_PKEY * generate_key() {
+    /* Allocate memory for the EVP_PKEY structure. */
+    EVP_PKEY * pkey = EVP_PKEY_new();
+    if(!pkey)
+    {
+        return NULL;
+    }
+    
+    /* Generate the RSA key and assign it to pkey. */
+    FILE *fp = fopen("./root-cert/private/EMEN.key", "r");
+    RSA * rsa = PEM_read_RSAPrivateKey(fp, NULL, NULL, "elephantmen");
+    if(!EVP_PKEY_assign_RSA(pkey, rsa))
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
+    
+    /* The key has been generated, return it. */
+    return pkey;
+}
 
-//   char sni[30];
-//   memset(sni, 0, 30);
-//   if (buf[0] == 22) {
-//     unsigned short totalLen = (buf[3] << 8) | buf[4];
-//     int lenSoFar = 0;
-//     if (buf[5] == 1) {
-//       unsigned char sessIdLen = buf[43];
-//       lenSoFar += sessIdLen + 43 + 1;
-//       unsigned short cipherLen = ((unsigned char) buf[lenSoFar] << 8) | (unsigned char) buf[lenSoFar + 1];
-//       lenSoFar += cipherLen + 2;
-//       unsigned char compressLen = buf[lenSoFar];
-//       lenSoFar += compressLen + 1;
-//       unsigned short extensionLen = (unsigned char) buf[compressLen] << 8 | (unsigned char) buf[compressLen + 1];
-//       lenSoFar += 2;
-//       while (lenSoFar < totalLen) {
-//         if (buf[lenSoFar] << 8 | buf[lenSoFar + 1] == 0){
-//           if (buf[lenSoFar + 6] == 0) {
-//             memcpy(sni, buf + lenSoFar + 9, buf[lenSoFar + 7] << 8 | buf[lenSoFar + 8]);
-//             printf("SNI: %s\n", sni);
-//             break;
-//           }
-//         }
-//         lenSoFar = lenSoFar + (buf[lenSoFar + 3] << 8 | buf[lenSoFar + 4]) + 4;
-//       }
-//     }
-//     n = write(client->fwdfd, buf, n);
-//     if (n < 0) {
-//       error("ERROR writing for tunnel");
-//       return 0;
-//     }
-//   }
-//   free(buf);
-// }
+EVP_PKEY * get_CA() {
+  EVP_PKEY * pkey = EVP_PKEY_new();
+    if(!pkey)
+    {
+        return NULL;
+    }
+    
+    /* Generate the RSA key and assign it to pkey. */
+    FILE *fp = fopen("./authorityCerts/myCA.key", "r");
+    RSA * rsa = PEM_read_RSAPrivateKey(fp, NULL, NULL, "onedove");
+    if(!EVP_PKEY_assign_RSA(pkey, rsa))
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
+    
+    /* The key has been generated, return it. */
+    return pkey;
+}
+
+X509 * generate_x509(EVP_PKEY * pkey, char * CN) {
+    /* Allocate memory for the X509 structure. */
+    X509 * x509 = X509_new();
+    X509 * CAx509 = X509_new();
+    if(!x509)
+    {
+        return NULL;
+    }
+    
+    /* Set the serial number. */
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    
+    /* This certificate is valid from now until exactly one year from now. */
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);
+    
+    /* Set the public key for our certificate. */
+    X509_set_pubkey(x509, pkey);
+    
+    /* We want to copy the subject name to the issuer name. */
+    BIO *i = BIO_new(BIO_s_file());
+
+    if ((BIO_read_filename(i, "./authorityCerts/myCA.pem") <= 0) || ((CAx509 = PEM_read_bio_X509_AUX(i, NULL, NULL, NULL)) == NULL)) {
+        return NULL;
+    }
+
+    X509_NAME * name = X509_get_subject_name(CAx509);
+    
+    /* Set the country code and common name. */
+    X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"CA",        -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O",  MBSTRING_ASC, (unsigned char *)"MyCompany", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *) CN, -1, -1, 0);
+    
+    /* Now set the issuer name. */
+    X509_set_issuer_name(x509, name);
+    
+    /* Actually sign the certificate with our key. */
+    if(!X509_sign(x509, get_CA(), EVP_sha1()))
+    {
+        X509_free(x509);
+        return NULL;
+    }
+    
+    return x509;
+}
+
+void print_cache(entry* cache) {
+  for (int i = 0; i < ENTRIES; i++) {
+    if (cache[i].key) {
+      printf("CACHE ENTRY: %s\n", cache[i].key);
+    }
+  }
+}
