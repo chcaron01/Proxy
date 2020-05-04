@@ -96,6 +96,8 @@ item* find_item(int key, item* fd_lookup);
 // Currently unused function to get sni without OpenSSL
 char* get_sni(int fd);
 
+void add_content_length(entry* e);
+
 int is_rate_limited(char* value, entry* cache, int* lru, int* filled, float rate);
 
 // SSL helper functions
@@ -1122,5 +1124,36 @@ void print_cache(entry* cache) {
     if (cache[i].key) {
       printf("CACHE ENTRY: %s\n", cache[i].key);
     }
+  }
+}
+
+void add_content_length(entry* e) {
+  if (!strstr(e->value, "Content-Length:")){
+    char* end_head = strstr(e->value, "\r\n\r\n");
+    *end_head = 0;
+    int header_length = strlen(e->value) + 4;
+    int content_length = e->bytes_len - header_length;
+    char cl[9];
+    sprintf(cl, "%ld", content_length);
+    char cl_header[27];
+    strcpy(cl_header, "Content-Length: ");
+    strcat(cl_header, cl);
+    strcat(cl_header, "\r\n");
+    *end_head = '\r';
+
+    char buf[BUFSIZE];
+    bzero(buf, BUFSIZE);
+    char* endline = strstr(e->value, "\r\n");
+    *endline = 0;
+    int bytes = e->bytes_len + strlen(cl_header);
+    int endl_len = strlen(e->value);
+    memcpy(buf, e->value, endl_len);
+    memcpy(buf + endl_len, "\r\n", 2);
+    memcpy(buf + endl_len + 2, cl_header, strlen(cl_header));
+    memcpy(buf + endl_len + 2 + strlen(cl_header), endline + 2, e->bytes_len - (endl_len + 2));
+    free(e->value);
+    e->value = malloc(bytes);
+    memcpy(e->value, buf, bytes);
+    e->bytes_len = bytes;
   }
 }
