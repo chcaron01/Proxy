@@ -96,7 +96,8 @@ item* find_item(int key, item* fd_lookup);
 char* get_sni(int fd);
 
 int te_helper(SSL* ssl, char* buf, int total_length, int buf_size, int bytes_read);
-void add_content_length(entry* e);
+
+void add_cl(entry* e);
 
 int is_rate_limited(char* value, entry* cache, int* lru, int* filled, float rate);
 
@@ -292,7 +293,6 @@ int main(int argc, char **argv) {
                 *end_method = ' ';
                 int status = check_cache(buf, cache, lru, &filled, &bytes_read, NULL);
                 if (status != -1)
-                  printf("Buffer: %s\n", buf);
                   status = send_to_server(buf, cache, lru, status, &bytes_read);
                 
                 if (status)
@@ -325,7 +325,6 @@ int main(int argc, char **argv) {
               continue;
             }
             printf("Message read from socket\n");
-            printf("Message:\n%s\n", buf);
 
             char* method = buf;
             char* end_method = strstr(buf, " ");
@@ -347,7 +346,6 @@ int main(int argc, char **argv) {
               int bytes_read = 0;
               char key[1000];
               int status = check_cache(buf, cache, lru, &filled, &bytes_read, key);
-              printf("Cache has been checked...");
               if (status != -1) { // GET request was not found in the cache
                 printf("Request not found\n");
                 n = SSL_write(cur_item->fwdssl, buf, n);
@@ -412,7 +410,6 @@ int main(int argc, char **argv) {
               remove_item(cur_item, fd_lookup, &active_fd_set);
               continue;
             }
-            printf("Complete\n");
           }
         }
       }
@@ -502,8 +499,6 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
     n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
   }
 
-  printf("Message received:\n%s\nDone\n", buf);
-
   if (n < 0) {
     error("ERROR reading from socket for https response");
     return 0;
@@ -538,14 +533,11 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
     rem_idx = lru[0];
   }
   update_LRU(lru, cache, cur_item->cache_key, object, max_age, start_time, bytes_read, rem_idx);
-  fprintf(stderr, "LRU updated\n");
-  entry* this_entry = &cache[rem_idx];
-  fprintf(stderr, "Old cache value:\n%s\nDone\n", this_entry->value);
-  fprintf(stderr, "Adding content length...");
-  add_content_length(this_entry);
-  fprintf(stderr, "Content length added\n");
-  printf("New cache value:\n%s\nDone\n", cache[rem_idx].value);
-  //printf("Echo from server: %s\n", buf);
+  entry* this_entry = &(cache[rem_idx]);
+  add_cl(this_entry);
+  bzero(buf, BUFSIZE);
+  memcpy(buf, this_entry->value, this_entry->bytes_len);
+  *bytes = this_entry->bytes_len;
   return 1;
 }
 
@@ -799,7 +791,6 @@ int connect_init(char* buf, int clientfd) {
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
-        printf("connect_init\n");
         return -1;
     }
 
@@ -889,7 +880,6 @@ int cert_cb(SSL *ssl, void* server) {
   if (cert_server) {
     X509_NAME *subj_server = X509_get_subject_name(cert_server);
     int pos_server = X509_NAME_get_index_by_NID(subj_server, NID_commonName, 0);
-    printf("%d\n", pos_server);
     if (pos_server == -1) {
       printf("Client: No common name...? Common name not modified\n");
       return 0;
@@ -898,7 +888,6 @@ int cert_cb(SSL *ssl, void* server) {
       X509_NAME_ENTRY *e_server = X509_NAME_get_entry(subj_server, pos_server);
       ASN1_STRING *x = X509_NAME_ENTRY_get_data(e_server);
       char* cn = ASN1_STRING_data(x);
-      printf("\nCOMMON NAME:%s\n", cn);
       EVP_PKEY * cert_key = generate_key();
       X509* certificate = generate_x509(cert_key, cn);
 
@@ -918,7 +907,6 @@ int cert_cb(SSL *ssl, void* server) {
 }
 
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
-  printf("Remove item has been called\n");
   if (cur_item->ssl != NULL) {
     SSL_shutdown(cur_item->ssl);
     SSL_free(cur_item->ssl);
@@ -943,7 +931,6 @@ void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
     }
   }
   *cur_item = NULL_ITEM;
-  printf("Remove item returning\n");
 }
 
 int insert_item(item in_item, item* fd_lookup) {
@@ -1206,10 +1193,8 @@ void print_cache(entry* cache) {
   }
 }
 
-void add_content_length(entry* e) {
-  fprintf(stderr, "add_content_length has been called\n");
+void add_cl(entry* e) {
   if (!strstr(e->value, "Content-Length:")){
-    printf("In the if\n");
     char* end_head = strstr(e->value, "\r\n\r\n");
     *end_head = 0;
     int header_length = strlen(e->value) + 4;
@@ -1222,9 +1207,7 @@ void add_content_length(entry* e) {
     strcat(cl_header, "\r\n");
     *end_head = '\r';
 
-    printf("Done chunk 1\n");
-
-    char buf[BUFSIZE];
+    char* buf = malloc(BUFSIZE);
     bzero(buf, BUFSIZE);
     char* endline = strstr(e->value, "\r\n");
     *endline = 0;
@@ -1238,5 +1221,6 @@ void add_content_length(entry* e) {
     e->value = malloc(bytes);
     memcpy(e->value, buf, bytes);
     e->bytes_len = bytes;
+    free(buf);
   }
 }
