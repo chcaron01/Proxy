@@ -203,6 +203,7 @@ int main(int argc, char **argv) {
 
   clientlen = sizeof(clientname);
   while (1) {
+    print_cache(cache);
     read_fd_set = active_fd_set;
     int select_val = select (FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
     if (select_val < 0)
@@ -532,7 +533,10 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   else {
     rem_idx = lru[0];
   }
-  update_LRU(lru, cache, cur_item->cache_key, object, max_age, start_time, bytes_read, rem_idx);
+  printf("cache key: %s\n", cur_item->cache_key);
+  char* key = malloc(strlen(cur_item->cache_key));
+  memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key));
+  update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, rem_idx);
   entry* this_entry = &(cache[rem_idx]);
   add_cl(this_entry);
   bzero(buf, BUFSIZE);
@@ -659,7 +663,6 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
   printf("In check_cache\n");
-  print_cache(cache);
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -967,6 +970,7 @@ void initialize_lru(int* lru) {
 }
 
 void add_entry(entry* cache, int cacheEntry, char* key, char* object, int max_age, int start_time, int bytes){
+  printf("KEY: %s\n", key);
   cache[cacheEntry].time_dead = max_age;
   cache[cacheEntry].key = key;
   cache[cacheEntry].value = object;
