@@ -203,7 +203,6 @@ int main(int argc, char **argv) {
 
   clientlen = sizeof(clientname);
   while (1) {
-    print_cache(cache);
     read_fd_set = active_fd_set;
     int select_val = select (FD_SETSIZE, &read_fd_set, NULL, NULL, NULL);
     if (select_val < 0)
@@ -360,6 +359,8 @@ int main(int argc, char **argv) {
               }
               else { // GET request was found in cache
                 printf("Request was found\n");
+                printf("%s\n", buf);
+                printf("%d\n", bytes_read);
                 n = SSL_write(cur_item->ssl, buf, bytes_read);
                 if (n < 0) {
                   error("ERROR writing HTTPS message");
@@ -420,11 +421,12 @@ int main(int argc, char **argv) {
 
 int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes) {
   int bytes_read = 0;
-  int target = 50000;
+  int target = 500000;
   int header_length = 0;
   int cl_found = 0;
   int te_found = 0;
   int n = strlen(buf);
+  printf("%s\n", buf);
 
   // Loop for filling buf with the entire message
   // There is a break for the te_found case. The loop conditions are primarily for cl_found
@@ -459,6 +461,9 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
     else {
       //Get CONTENT length or Transfer-Encoding
       char* cl = strstr(buf, "Content-Length: ");
+      if (!cl) {
+        cl = strstr(buf, "content-length: ");
+      }
       char* te = strstr(buf, "Transfer-Encoding: chunked");
       if (cl) {
         cl_found = 1;
@@ -497,6 +502,11 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         bytes_read += (msg_length + header_length + 4); // +4 because of the \r\n\r\n
       }
     }
+    printf("Target %d\n", target);
+    printf("bytes read %d\n", bytes_read);
+    if (bytes_read >= target) {
+      break;
+    }
     n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
   }
 
@@ -533,7 +543,6 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   else {
     rem_idx = lru[0];
   }
-  printf("cache key: %s\n", cur_item->cache_key);
   char* key = malloc(strlen(cur_item->cache_key));
   memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key));
   update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, rem_idx);
@@ -663,6 +672,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
   printf("In check_cache\n");
+  print_cache();
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -710,7 +720,7 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read,
       memcpy(buf + endl_len, "\r\n", 2);
       memcpy(buf + endl_len + 2, age_header, strlen(age_header));
       memcpy(buf + endl_len + 2 + strlen(age_header), endline + 2, cache[key_exists].bytes_len - (endl_len + 2));
-      *endline = '\n';
+      *endline = '\r';
       pushback_LRU(lru, key_exists);
       return -1;
     }
@@ -1198,7 +1208,7 @@ void print_cache(entry* cache) {
 }
 
 void add_cl(entry* e) {
-  if (!strstr(e->value, "Content-Length:")){
+  if (!strstr(e->value, "Content-Length:") && !strstr(e->value, "content-length:")){
     char* end_head = strstr(e->value, "\r\n\r\n");
     *end_head = 0;
     int header_length = strlen(e->value) + 4;
