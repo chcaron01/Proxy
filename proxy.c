@@ -75,12 +75,9 @@ void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
 // Checks the cache or something
-
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key);
 // Reads all of https response and inserts it into the cache
 int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes);
-
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
 
 void print_cache(entry* cache);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
@@ -95,6 +92,8 @@ int insert_item(item in_item, item* fd_lookup);
 item* find_item(int key, item* fd_lookup);
 // Currently unused function to get sni without OpenSSL
 char* get_sni(int fd);
+
+int te_helper(SSL* ssl, char* buf, int total_length, int buf_size, int bytes_read);
 
 // SSL helper functions
 
@@ -400,18 +399,46 @@ int main(int argc, char **argv) {
 }
 
 int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes) {
-  int bytes_read = 0; //NEEDS WORK: is strlen okay?
+  int bytes_read = 0;
   int target = 50000;
   int header_length = 0;
   int cl_found = 0;
+  int te_found = 0;
   int n = strlen(buf);
-  printf("Entering while loop with %d bytes read\n", n);
-  while (n > 0 && target > bytes_read) {
-    printf("Bytes read on previous iteration: %d\n", n);
-    // NEEDS WORK: Needs to implement Transfer-Encoding: chunked
-    if (!cl_found) {
-      //Get CONTENT length
+
+  // There is a break for the te_found case. The loop conditions are primarily for cl_found
+  while (n > 0 && (target>bytes_read || te_found) ) {
+    if (cl_found) {
+      bytes_read += n;
+    }
+    else if (te_found) {
+      // NEEDS WORK: Not clearing buf (on copy/delete) so we have to be good about getting lengths right (and not using strlen)
+      // NEEDS WORK: Remember to insert Content-Length when getting message from the cache
+      char* start_ptr = buf + bytes_read;
+      char* end_length = strstr(start_ptr, "\r\n");
+      if (end_length == NULL) {
+        error("ERROR chunk corrupted");
+        return 0;
+      }
+      int length = (int)strtol(start_ptr, &end_length, 16);
+
+      if (length == 0) {
+        break;
+      }
+      char* start_message = end_length + 2;
+      int chunk_read = n - (start_message - start_ptr);
+      bcopy(start_message, start_ptr, chunk_read);
+      int succ = te_helper(cur_item->ssl, start_ptr, length, BUFSIZE - (start_message-buf), chunk_read);
+      if (!succ) {
+        error("ERROR while completing a chunked read from server");
+        return 0;
+      }
+      bytes_read += length;
+    }
+    else {
+      //Get CONTENT length or Transfer-Encoding
       char* cl = strstr(buf, "Content-Length: ");
+      char* te = strstr(buf, "Transfer-Encoding: chunked");
       if (cl) {
         cl_found = 1;
         target = atoi(cl + 16);
@@ -421,9 +448,34 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         header_length = strlen(buf) + 4;
         *end_head = '\r';
         target += header_length;
+        bytes_read += n;
+      }
+      else if (te) {
+        te_found = 1;
+        char* te_end = strstr(te, "\r\n") + 2;
+        char* header_end = strstr(buf, "\r\n\r\n"); // used to help calculate how much of the chunk has been read
+        // find the first \r\n after the end of the header and add 2 to get past it. That is the
+        // location of the first character of the chunk. Subtracting buf gives the data read that
+        // isn't a part of the chunk
+        int chunk_read = n - (strstr(header_end+4, "\r\n")+2-buf);
+        bcopy(te_end, te, n - (te-buf)); // Removing the TE header (will send later as CL)
+        header_end = strstr(buf, "\r\n\r\n");
+        int header_length = header_end - buf;
+        char* msg_start = header_end + 4;
+        char* end_length = strstr(msg_start, "\r\n");
+        int msg_length = (int)strtol(msg_start, &end_length, 16);
+        char* data_start = end_length + 2;
+        bcopy(data_start, msg_start, n - (header_length+4)); // Removing the chunk size indicator
+
+        int succ = te_helper(cur_item->ssl, msg_start, msg_length, BUFSIZE - (msg_start-buf), chunk_read);
+        if (!succ) {
+          error("ERROR completing a chunked read from server");
+          return 0;
+        }
+
+        bytes_read += (msg_length + header_length + 4); // +4 because of the \r\n\r\n
       }
     }
-    bytes_read += n;
     n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
   }
 
@@ -720,6 +772,22 @@ int connect_init(char* buf, int clientfd) {
     printf("Okay response sent to client\n");
 
     return serverfd;
+}
+
+int te_helper(SSL* ssl, char* buf, int total_length, int buf_size, int bytes_read) {
+  while (bytes_read < total_length) {
+    int n = SSL_read(ssl, buf + bytes_read, buf_size - bytes_read);
+    if (n < 0) {
+      error("ERROR reading to complete a chunk");
+      return 0;
+    }
+    bytes_read += n;
+  }
+  if (bytes_read != total_length+2) {
+    printf("Read the incorrect number of bytes. Expected %d but got %d\n", total_length, bytes_read);
+    return 0;
+  }
+  return 1;
 }
 
 int https_init(item* client, item* server) {
