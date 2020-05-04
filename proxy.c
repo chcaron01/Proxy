@@ -27,9 +27,10 @@
 #include <openssl/asn1.h>
 
 #define BUFSIZE 10000000
-#define ENTRIES 10
+#define ENTRIES 100
 #define MAX_HTTPS_CLIENTS 20
 #define IPS 100
+#define MAX_LINE 1000
 
 typedef struct {
   char * key;
@@ -44,39 +45,44 @@ typedef struct item
 {
     int key;
     int fwdfd;
+    char cache_key[MAX_LINE];
     SSL* ssl;
     SSL* fwdssl;
 } item;
 
 const item NULL_ITEM = { .key = -1,
                          .fwdfd = -1,
+                         .cache_key = 0,
                          .ssl = NULL,
                          .fwdssl = NULL };
 
 int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes_read);
 // Initializes values in each cache entry to NULL or 0
-void initialize_cache(entry* cache, int size);
+void initialize_cache(entry* cache);
 // Initializes values in lru to index value
-void initialize_lru(int* lru, int size);
+void initialize_lru(int* lru);
 // Sets each entry child in cache to respective buffer
 void add_entry(entry* cache, int cacheEntry, char* key, char* object, int max_age, int start_time, int bytes);
 // Frees struct values for entry
 void free_entry(entry* cache, int cacheEntry);
 // Finds and returns an index in cache for which time has expired. Returns -1 otherwise.
-int find_dead_times(entry* cache, int size);
+int find_dead_times(entry* cache);
 // For index to be replaced in cache, the entry is freed, new entry is added, and pushes index value to back
-void update_LRU(int* lru, entry* cache, char* key, char* object, int max_age, int start_time, int bytes, int index, int size);
+void update_LRU(int* lru, entry* cache, char* key, char* object, int max_age, int start_time, int bytes, int index);
 // Pushes back specific index value to back of array (lru[0] is LRU, lru[length(lru) - 1] is MRU)
-void pushback_LRU(int* lru, int index, int size);
+void pushback_LRU(int* lru, int index);
 // Returns index if key is found in cache. Returns -1 if key not found
-int find_entry(entry* cache, char* key, int size);
+int find_entry(entry* cache, char* key);
 // Handles each input line. For PUT: creates key, object, max-age buffers. Check if key exists. Check if cache is filled.
-// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value NEEDS WORK: Is this comment for check_cache()?
 void handle_line(entry* cache, char* line, int* lru, int* filled, FILE* out);
+// Check if there are expired times. Otherwise replace lru. For GET: check if key exists, fprintf object value
 // Checks the cache or something
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read);
 
-void print_cache(entry* cache, int size);
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key);
+// Reads all of https response and inserts it into the cache
+int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes);
+
+void print_cache(entry* cache);
 // Called to handle a connect request. Does not handle the tunneling, only sets it up
 int connect_init(char* buf, int clientfd);
 // Creates the https connections to client and server. Inserts the SSL* structures into the items
@@ -141,12 +147,12 @@ int main(int argc, char **argv) {
 
   entry* cache = (entry*)malloc(sizeof(entry) * ENTRIES);
   entry* rateLimiting = (entry*)malloc(sizeof(entry) * IPS);
-  initialize_cache(cache, ENTRIES);
-  initialize_cache(rateLimiting, IPS);
+  initialize_cache(cache);
+  initialize_cache(rateLimiting);
   int* lru = (int*)malloc(sizeof(int) * ENTRIES);
   int* rateLRU = (int*)malloc(sizeof(int) * IPS);
-  initialize_lru(lru, ENTRIES);
-  initialize_lru(rateLRU, IPS);
+  initialize_lru(lru);
+  initialize_lru(rateLRU);
   int filled = 0;
   int rateFilled = 0;
 
@@ -155,6 +161,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 2*MAX_HTTPS_CLIENTS; i++) {
     item insert;
     insert.key = -1;
+    bzero(insert.cache_key, MAX_LINE);
     fd_lookup[i] = insert;
   }
 
@@ -228,6 +235,7 @@ int main(int argc, char **argv) {
               error("ERROR on inet_ntoa\n");
 
             printf("server established connection with %s (%s)\n", hostp->h_name, hostaddrp);
+
             if (is_rate_limited(hostaddrp, rateLimiting, rateLRU, &rateFilled, ratems)) {
               error("RATE LIMITED");
               close(i); // QUESTION: Do we need to close i?
@@ -236,11 +244,15 @@ int main(int argc, char **argv) {
             else {
               bzero(buf, BUFSIZE);
               n = read(i, buf, BUFSIZE);
-              if (n < 0) 
-                error("ERROR reading from socket");
+              if (n < 0) {
+                error("ERROR reading from socket on first message");
+                item it;
+                it.key = i;
+                remove_item(&it, fd_lookup, &active_fd_set);
+                continue;
+              }
               printf("server received %d bytes: %s", n, buf);
               int bytes_read = 0;
-              // NEEDS WORK: Assumes only explicit CONNECT or GET requests get here. Valid?
 
               // Checking if the received message is a CONNECT or GET request
               char* method = buf;
@@ -250,6 +262,7 @@ int main(int argc, char **argv) {
                 printf("Connect method received\n");
                 *end_method = ' ';
                 item new_client, new_server;
+
                 int serverfd = connect_init(buf, i); // NEEDS WORK: client and server items input by reference
                 if (!serverfd || serverfd == -1) {
                   error("ERROR with initializing the HTTPS connections");
@@ -275,18 +288,20 @@ int main(int argc, char **argv) {
               else if (strcmp(method, "GET") == 0) {
                 printf("Get method received\n");
                 *end_method = ' ';
-                int status = check_cache(buf, cache, lru, &filled, &bytes_read);
-                printf("%d\n", status);
+                int status = check_cache(buf, cache, lru, &filled, &bytes_read, NULL);
                 if (status != -1)
-                  status = send_to_server(buf, cache, lru, status, &bytes_read);              
+                  printf("Buffer: %s\n", buf);
+                  status = send_to_server(buf, cache, lru, status, &bytes_read);
+                
                 if (status)
                   n = write(i, buf, bytes_read);
+
                 if (n <= 0) 
                   error("ERROR writing to socket");
-                
-                close(i); // QUESTION: Do we need to close i?
-                FD_CLR (i, &active_fd_set);
-              }
+                  
+                  close(i); // QUESTION: Do we need to close i?
+                  FD_CLR (i, &active_fd_set);
+                }
               else {
                 error("ERROR received unrecognized message method. Message was not forwarded");
               }
@@ -313,28 +328,34 @@ int main(int argc, char **argv) {
             char* method = buf;
             char* end_method = strstr(buf, " ");
             int is_get = 0;
+            int is_response = 0;
             if (end_method != NULL) {
               *end_method = 0;
               if (strcmp(method, "GET") == 0) {
                 is_get = 1;
               }
+              if (strncmp(method, "HTTP/", 5) == 0) {
+                is_response = 1;
+              }
               *end_method = ' ';
             }
 
-            printf("Entering if\n");
             if (is_get) {
               printf("Message is a GET request\n");
               int bytes_read = 0;
-              int status = check_cache(buf, cache, lru, &filled, &bytes_read);
+              char key[1000];
+              int status = check_cache(buf, cache, lru, &filled, &bytes_read, key);
               printf("Cache has been checked...");
               if (status != -1) { // GET request was not found in the cache
                 printf("Request not found\n");
-                n = SSL_write(cur_item->fwdssl, buf, n); // NEEDS WORK: Needs cache insert
+                n = SSL_write(cur_item->fwdssl, buf, n);
                 if (n < 0) {
                   error("ERROR writing HTTPS message");
                   remove_item(cur_item, fd_lookup, &active_fd_set);
                   continue;
                 }
+                item* server_item = find_item(cur_item->fwdfd, fd_lookup);
+                strcpy(server_item->cache_key, key);
               }
               else { // GET request was found in cache
                 printf("Request was found\n");
@@ -346,13 +367,28 @@ int main(int argc, char **argv) {
                 }
               }
             }
-            else { // either server HTTPS response or different type of HTTP method
+            else if (is_response) { // HTTPS response
+              printf("Receiving https response...\n");
+              int bytes_read = 0;
+              int succ = receive_https_response(cur_item, buf, cache, lru, &filled, &bytes_read);
+              if (!succ) {
+                error("ERROR reading HTTPS response from server");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                continue;
+              }
+              n = SSL_write(cur_item->fwdssl, buf, bytes_read);
+              if (n < 0) {
+                error("ERROR writing HTTPS response to client");
+                remove_item(cur_item, fd_lookup, &active_fd_set);
+                continue;
+              }
+              printf("Successfully cached and forwarded https response\n");
+            }
+            else { // a different type of HTTP method
               printf("Forwarding https message...\n");
               n = SSL_write(cur_item->fwdssl, buf, n);
-              printf("On the other side\n");
               if (n < 0) {
                 error("ERROR writing HTTPS message");
-                printf("See ya\n");
                 remove_item(cur_item, fd_lookup, &active_fd_set);
                 continue;
               }
@@ -379,6 +415,73 @@ int main(int argc, char **argv) {
       }
     }
   }
+}
+
+int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes) {
+  int bytes_read = 0; //NEEDS WORK: is strlen okay?
+  int target = 50000;
+  int header_length = 0;
+  int cl_found = 0;
+  int n = strlen(buf);
+  printf("Entering while loop with %d bytes read\n", n);
+  while (n > 0 && target > bytes_read) {
+    printf("Bytes read on previous iteration: %d\n", n);
+    // NEEDS WORK: Needs to implement Transfer-Encoding: chunked
+    if (!cl_found) {
+      //Get CONTENT length
+      char* cl = strstr(buf, "Content-Length: ");
+      if (cl) {
+        cl_found = 1;
+        target = atoi(cl + 16);
+        //Get HEADER length
+        char* end_head = strstr(buf, "\r\n\r\n");
+        *end_head = 0;
+        header_length = strlen(buf) + 4;
+        *end_head = '\r';
+        target += header_length;
+      }
+    }
+    bytes_read += n;
+    n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
+  }
+
+  if (n < 0) {
+    error("ERROR reading from socket for https response");
+    return 0;
+  }
+  char* object = malloc(bytes_read);
+  memcpy(object, buf, bytes_read);
+  int max_age;
+  char* time_left = strstr(buf, "Cache-Control: max-age=");
+  int start_time = time(NULL);
+  int bytes_len = bytes_read;
+  *bytes = bytes_read;
+  if (time_left) {
+    max_age = atoi(time_left + 23) + start_time;
+  }
+  else {
+    max_age = 3600 + start_time;
+  }
+
+  int rem_idx;
+  int dead_time = find_dead_times(cache);
+  // If cache is not filled
+  if (*filled < ENTRIES) {
+    (*filled)++;
+    rem_idx = *filled - 1;
+  }
+  // If an entry's time has expired
+  else if (dead_time != -1) {
+    rem_idx = dead_time;
+  }
+  // Return lru
+  else {
+    rem_idx = lru[0];
+  }
+
+  update_LRU(lru, cache, cur_item->cache_key, object, max_age, start_time, bytes_read, rem_idx);
+  printf("Echo from server: %s\n", buf);
+  return 1;
 }
 
 int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes){
@@ -412,7 +515,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     strncpy(key + strlen(hostname), directory, strlen(directory) + 1);
     *end_host = '\r';
     *end_dir = ' ';
-  
+
     /* gethostbyname: get the server's DNS entry */
     if (server == NULL) {
         fprintf(stderr,"ERROR, no such host as %s\n", hostname);
@@ -472,7 +575,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
       bytes_read += n;
     }
     while (n > 0 && target > bytes_read);
-  
+
     if (n < 0) {
       error("ERROR reading from socket");
       return 0;
@@ -491,15 +594,15 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
       max_age = 3600 + start_time;
     }
     
-    update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry, ENTRIES);
+    update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
     printf("Echo from server: %s\n", buf);
     close(sockfd);
     return 1;
 }
 
-int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read) {
+int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
   printf("In check_cache\n");
-  print_cache(cache, ENTRIES);
+  print_cache(cache);
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -517,15 +620,15 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read)
   char* key = malloc(strlen(hostname) + strlen(directory) + 1);
   strncpy(key, hostname, strlen(hostname));
   strncpy(key + strlen(hostname), directory, strlen(directory) + 1);
+  if (ret_key != NULL)
+    strcpy(ret_key, key);
   // Return back to original
   *end_host = '\r';
   *end_dir = ' ';
   printf("Searching for entry...");
-  int key_exists = find_entry(cache, key, ENTRIES);
-  printf("Entry searched for\n");
-
+  int key_exists = find_entry(cache, key);
   free(key);
-  int dead_time = find_dead_times(cache, ENTRIES);
+  int dead_time = find_dead_times(cache);
   // If key is in cache
   if (key_exists != -1) {
     if (cache[key_exists].time_dead < time(NULL)) {
@@ -548,7 +651,7 @@ int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read)
       memcpy(buf + endl_len + 2, age_header, strlen(age_header));
       memcpy(buf + endl_len + 2 + strlen(age_header), endline + 2, cache[key_exists].bytes_len - (endl_len + 2));
       *endline = '\n';
-      pushback_LRU(lru, key_exists, ENTRIES);
+      pushback_LRU(lru, key_exists);
       return -1;
     }
   }
@@ -571,7 +674,7 @@ int is_rate_limited(char* value, entry* cache, int* lru, int* filled, float rate
   char* key = malloc(strlen(value) + 1);
   strncpy(key, value, strlen(value));
   // Return back to original
-  int key_exists = find_entry(cache, key, IPS);
+  int key_exists = find_entry(cache, key);
 
   // If key is in cache
   if (key_exists != -1) {
@@ -579,12 +682,12 @@ int is_rate_limited(char* value, entry* cache, int* lru, int* filled, float rate
     gettimeofday(&currTime, NULL);
     int deltatime = (currTime.tv_sec - cache[key_exists].IPalive.tv_sec)  * 1000000 + (currTime.tv_usec - cache[key_exists].IPalive.tv_usec);
     if (deltatime < rate) {
-      pushback_LRU(lru, key_exists, IPS);
+      pushback_LRU(lru, key_exists);
       return 1;
     }
     else {
       cache[key_exists].IPalive = currTime;
-      pushback_LRU(lru, key_exists, IPS);
+      pushback_LRU(lru, key_exists);
       return 0;
     }
   }
@@ -600,6 +703,7 @@ int is_rate_limited(char* value, entry* cache, int* lru, int* filled, float rate
     free(cache[lru[0]].key);
     cache[lru[0]].key = key;
     gettimeofday(&(cache[lru[0]].IPalive), NULL);
+    pushback_LRU(lru, lru[0]);
     return 0;
   }
 }
@@ -732,7 +836,6 @@ int cert_cb(SSL *ssl, void* server) {
   return 0;
 }
 
-// NEEDS WORK: must confirm assumption that remove_item is never called on an incomplete item
 void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
   printf("Remove item has been called\n");
   if (cur_item->ssl != NULL) {
@@ -781,16 +884,16 @@ item* find_item(int key, item* fd_lookup) {
   return NULL;
 }
 
-void initialize_cache(entry* cache, int size) {
-  for (int i = 0; i < size; i++){
+void initialize_cache(entry* cache) {
+  for (int i = 0; i < ENTRIES; i++){
       cache[i].key = NULL;
       cache[i].value = NULL;
       cache[i].time_dead = 0;
   }
 }
 
-void initialize_lru(int* lru, int size) {
-  for (int i = 0; i < size; i++) {
+void initialize_lru(int* lru) {
+  for (int i = 0; i < ENTRIES; i++) {
     lru[i] = i;
   }
 }
@@ -812,17 +915,17 @@ void free_entry(entry* cache, int cacheEntry){
   }
 }
 
-void update_LRU(int* lru, entry* cache, char* key, char* object, int max_age, int start_time, int bytes, int index, int size){
+void update_LRU(int* lru, entry* cache, char* key, char* object, int max_age, int start_time, int bytes, int index){
   free_entry(cache, index);
   add_entry(cache, index, key, object, max_age, start_time, bytes);
-  pushback_LRU(lru, index, size);
+  pushback_LRU(lru, index);
 }
 
-void pushback_LRU(int* lru, int index, int size) {
-  for (int i = 0; i < size; i++){
+void pushback_LRU(int* lru, int index) {
+  for (int i = 0; i < ENTRIES; i++){
     if (lru[i] == index) {
       int mru = lru[i];
-      for (int j = i; j < size - 1; j++) {
+      for (int j = i; j < ENTRIES - 1; j++) {
         lru[j] = lru[j+1];
         lru[j+1] = mru;
       }
@@ -831,8 +934,8 @@ void pushback_LRU(int* lru, int index, int size) {
   }
 }
   
-int find_dead_times(entry* cache, int size) {
-  for (int i = 0; i < size; i++){
+int find_dead_times(entry* cache) {
+  for (int i = 0; i < ENTRIES; i++){
     if (time(NULL) > cache[i].time_dead) {
       return i;
     }         
@@ -840,8 +943,8 @@ int find_dead_times(entry* cache, int size) {
   return -1;
 }
 
-int find_entry(entry* cache, char* key, int size) {
-  for (int i = 0; i < size; i++){
+int find_entry(entry* cache, char* key) {
+  for (int i = 0; i < ENTRIES; i++){
     if (cache[i].key != NULL) {
       if (!strcmp(cache[i].key, key)){
         return i;
@@ -1014,8 +1117,8 @@ X509 * generate_x509(EVP_PKEY * pkey, char * CN) {
     return x509;
 }
 
-void print_cache(entry* cache, int size) {
-  for (int i = 0; i < size; i++) {
+void print_cache(entry* cache) {
+  for (int i = 0; i < ENTRIES; i++) {
     if (cache[i].key) {
       printf("CACHE ENTRY: %s\n", cache[i].key);
     }
