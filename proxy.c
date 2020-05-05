@@ -420,11 +420,12 @@ int main(int argc, char **argv) {
 
 int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, int* filled, int* bytes) {
   int bytes_read = 0;
-  int target = 50000;
+  int target = 500000;
   int header_length = 0;
   int cl_found = 0;
   int te_found = 0;
   int n = strlen(buf);
+  printf("%s\n", buf);
 
   printf("Header:\n%s\nDone\n", buf);
 
@@ -453,6 +454,9 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
     else {
       //Get CONTENT length or Transfer-Encoding
       char* cl = strstr(buf, "Content-Length: ");
+      if (!cl) {
+        cl = strstr(buf, "content-length: ");
+      }
       char* te = strstr(buf, "Transfer-Encoding: chunked");
       if (cl) {
         cl_found = 1;
@@ -488,7 +492,9 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         }
       }
     }
-
+    if (bytes_read >= target) {
+      break;
+    }
     n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
   }
 
@@ -527,13 +533,15 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   else {
     rem_idx = lru[0];
   }
+
   printf("cache key: %s\n", cur_item->cache_key);
-  char* key = malloc(strlen(cur_item->cache_key));
-  memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key));
+  char* key = malloc(strlen(cur_item->cache_key) + 1);
+  memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key) + 1);
   update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, rem_idx);
   entry* this_entry = &(cache[rem_idx]);
   add_cl(this_entry);
   bzero(buf, BUFSIZE);
+
   memcpy(buf, this_entry->value, this_entry->bytes_len);
   *bytes = this_entry->bytes_len;
   return 1;
@@ -648,7 +656,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     else {
       max_age = 3600 + start_time;
     }
-    
+  
     update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
     printf("Echo from server: %s\n", buf);
     close(sockfd);
@@ -1215,7 +1223,7 @@ void print_cache(entry* cache) {
 }
 
 void add_cl(entry* e) {
-  if (!strstr(e->value, "Content-Length:")){
+  if (!strstr(e->value, "Content-Length:") && !strstr(e->value, "content-length:")){
     char* end_head = strstr(e->value, "\r\n\r\n");
     *end_head = 0;
     int header_length = strlen(e->value) + 4;
