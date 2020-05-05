@@ -359,8 +359,6 @@ int main(int argc, char **argv) {
               }
               else { // GET request was found in cache
                 printf("Request was found\n");
-                printf("%s\n", buf);
-                printf("%d\n", bytes_read);
                 n = SSL_write(cur_item->ssl, buf, bytes_read);
                 if (n < 0) {
                   error("ERROR writing HTTPS message");
@@ -502,8 +500,6 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         bytes_read += (msg_length + header_length + 4); // +4 because of the \r\n\r\n
       }
     }
-    printf("Target %d\n", target);
-    printf("bytes read %d\n", bytes_read);
     if (bytes_read >= target) {
       break;
     }
@@ -543,12 +539,14 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   else {
     rem_idx = lru[0];
   }
-  char* key = malloc(strlen(cur_item->cache_key));
-  memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key));
+  char* key = malloc(strlen(cur_item->cache_key) + 1);
+  memcpy(key, cur_item->cache_key, strlen(cur_item->cache_key) + 1);
+  printf("here\n");
   update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, rem_idx);
   entry* this_entry = &(cache[rem_idx]);
   add_cl(this_entry);
   bzero(buf, BUFSIZE);
+
   memcpy(buf, this_entry->value, this_entry->bytes_len);
   *bytes = this_entry->bytes_len;
   return 1;
@@ -663,7 +661,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
     else {
       max_age = 3600 + start_time;
     }
-    
+  
     update_LRU(lru, cache, key, object, max_age, start_time, bytes_read, cacheEntry);
     printf("Echo from server: %s\n", buf);
     close(sockfd);
@@ -672,7 +670,7 @@ int send_to_server(char* buf, entry* cache, int* lru, int cacheEntry, int* bytes
 
 int check_cache(char* buf, entry* cache, int* lru, int* filled, int* bytes_read, char* ret_key) {
   printf("In check_cache\n");
-  print_cache();
+  print_cache(cache);
   /* String parsing gets hostname */
   char* hostname = strstr(buf, "Host: ") + 6;
   char* end_host = strstr(hostname, "\r\n");
@@ -980,7 +978,6 @@ void initialize_lru(int* lru) {
 }
 
 void add_entry(entry* cache, int cacheEntry, char* key, char* object, int max_age, int start_time, int bytes){
-  printf("KEY: %s\n", key);
   cache[cacheEntry].time_dead = max_age;
   cache[cacheEntry].key = key;
   cache[cacheEntry].value = object;
