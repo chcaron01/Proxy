@@ -371,6 +371,9 @@ int main(int argc, char **argv) {
             else if (is_response) { // HTTPS response
               printf("Receiving https response...\n");
               int bytes_read = 0;
+              while (!strstr(buf, "\r\n\r\n")) {
+                n += SSL_read(cur_item->ssl, buf + n, BUFSIZE - n);
+              }
               int succ = receive_https_response(cur_item, buf, cache, lru, &filled, &bytes_read);
               if (!succ) {
                 error("ERROR reading HTTPS response from server");
@@ -425,7 +428,6 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   int cl_found = 0;
   int te_found = 0;
   int n = strlen(buf);
-  printf("%s\n", buf);
 
   printf("Header:\n%s\nDone\n", buf);
 
@@ -448,7 +450,8 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
       }
       bytes_read += cur_bytes;
       if (is_complete) {
-        //break;
+        printf("here\n");
+        break;
       }
     }
     else {
@@ -458,6 +461,12 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         cl = strstr(buf, "content-length: ");
       }
       char* te = strstr(buf, "Transfer-Encoding: chunked");
+      if (!te) {
+        te = strstr(buf, "Transfer-Encoding:  chunked");
+      }
+      if (!te) {
+        te = strstr(buf, "transfer-encoding: chunked");
+      }
       if (cl) {
         cl_found = 1;
         target = atoi(cl + 16);
@@ -475,26 +484,36 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         char* header_end = strstr(buf, "\r\n\r\n"); // used to help calculate how much of the chunk has been read
         // find the first \r\n after the end of the header and add 2 to get past it. That is the
         // location of the first character of the chunk. Subtracting buf gives the data read that
+        if (!header_end)
+          printf("header_end is null\n");
         // isn't a part of the chunk
+        if (!strlen(header_end+4)) {
+          n += SSL_read(cur_item->ssl, buf + n, BUFSIZE - n);
+        }
         int chunk_read = n - (strstr(header_end+4, "\r\n")+2-buf);
         bcopy(te_end, te, n - (te-buf)); // Removing the TE header (will send later as CL)
         header_end = strstr(buf, "\r\n\r\n");
         int header_length = header_end - buf;
         char* msg_start = header_end + 4;
+        printf("ABOUT TO GO INTO HELPER\n");
         int cur_bytes = te_helper(cur_item->ssl, msg_start, BUFSIZE - (msg_start-buf), chunk_read, &is_complete);
+        printf("OUT OF HELPER\n");
         if (cur_bytes < 0) {
           error("ERROR completing a chunked read from server");
           return 0;
         }
         bytes_read += (cur_bytes + header_length + 4); // +4 because of the \r\n\r\n
         if (is_complete) {
-          //break;
+          break;
         }
       }
     }
     if (bytes_read >= target) {
+      printf("here\n");
       break;
     }
+    printf("%d\n", bytes_read);
+    printf("%d\n", target);
     n = SSL_read(cur_item->ssl, buf + bytes_read, BUFSIZE - bytes_read);
   }
 
@@ -840,6 +859,7 @@ int connect_init(char* buf, int clientfd) {
 }
 
 int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* found_zero) {
+  printf("CHUNKSTART: %s\n", chunk_start);
   char* end_length = strstr(chunk_start, "\r\n");
   int msg_length = (int)strtol(chunk_start, &end_length, 16) + 2; // +2 for 
   if (msg_length == 2) { //2 is 0 because of the +2
@@ -951,7 +971,9 @@ void remove_item(item* cur_item, item* fd_lookup, fd_set* active_fd_p) {
   }
 
   if (cur_item->fwdfd != -1) {
-    FD_CLR (cur_item->fwdfd, active_fd_p);
+    if (cur_item->fwdfd <= FD_SETSIZE) {
+      FD_CLR (cur_item->fwdfd, active_fd_p);
+    }
     close(cur_item->fwdfd);
     item* rem_item = find_item(cur_item->fwdfd, fd_lookup);
     if (rem_item != NULL) {
