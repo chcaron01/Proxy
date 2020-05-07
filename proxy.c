@@ -95,7 +95,7 @@ item* find_item(int key, item* fd_lookup);
 // Currently unused function to get sni without OpenSSL
 char* get_sni(int fd);
 
-int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* found_zero);
+int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, char** last_char);
 
 void add_cl(entry* e);
 
@@ -432,7 +432,7 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
 
   // Loop for filling buf with the entire message
   // There is a break for the te_found case. The loop conditions are primarily for cl_found
-  int is_complete = 0;
+  char* is_complete = NULL;
   while (n > 0 && (target>bytes_read || te_found) ) {
     if (cl_found) {
       bytes_read += n;
@@ -447,7 +447,7 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
         return 0;
       }
       bytes_read += cur_bytes;
-      if (is_complete) {
+      if (is_complete != NULL) {
         break;
       }
     }
@@ -499,13 +499,12 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
           return 0;
         }
         bytes_read += (cur_bytes + header_length + 4); // +4 because of the \r\n\r\n
-        if (is_complete) {
+        if (is_complete != NULL) {
           break;
         }
       }
     }
-    if (bytes_read >= target) {
-      printf("here\n");
+    if (bytes_read >= target && !te_found) {
       break;
     }
     printf("Reading from the big context\n");
@@ -513,6 +512,9 @@ int receive_https_response(item* cur_item, char* buf, entry* cache, int* lru, in
   }
 
   //printf("Out of the loop:\n%s\nDone\n", buf);
+  if (is_complete != NULL) {
+    bytes_read = is_complete+1 - buf;
+  }
 
   if (n < 0) {
     error("ERROR reading from socket for https response");
@@ -852,13 +854,13 @@ int connect_init(char* buf, int clientfd) {
 }
 
 // excepts chunk_start to not be null and is null-terminated
-int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* found_zero) {
-  //printf("CHUNKSTART: %s\n", chunk_start);
+int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, char** last_char) {
+  printf("CHUNKSTART:\n%s\nDone\n", chunk_start);
   char* end_length = strstr(chunk_start, "\r\n");
   int msg_length = (int)strtol(chunk_start, &end_length, 16) + 2; // +2 for the \r\n after the size
   if (msg_length == 2) { //2 is 0 because of the +2
     printf("The zero has been found\n");
-    *found_zero = 1;
+    *last_char = chunk_start-1;
     *chunk_start = 0;
     return 0;
   }
@@ -872,23 +874,26 @@ int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* fo
       error("ERROR with message as part of a chunk");
       return -1;
     }
-    // printf("*Read %d bytes total but only needed %d\n", bytes_read, msg_length);
-    // printf("*Buffer is:\n%s\nDone\n", chunk_start);
+    printf("*Read %d bytes total but only needed %d\n", bytes_read, msg_length);
+    printf("*Buffer is:\n%s\nDone\n", chunk_start);
     char* new_chunk = end_chunk + 2;
     // The strstr is the start of the next message. new_chunk includes the chunk size value
     int new_chunk_size = bytes_read - (strstr(new_chunk, "\r\n") + 2 - chunk_start);
-    int full_new_message_size = bytes_read - (new_chunk - (chunk_start+bytes_read));
+    int full_new_message_size = bytes_read - (new_chunk - chunk_start);
     //printf("From new_chunk:\n%s\nDone\n", new_chunk);
     bcopy(new_chunk, end_chunk, full_new_message_size);
     char* end = end_chunk + full_new_message_size;
     *end = 0;
     //printf("Message is:\n%s\nDone\n", end_chunk);
     // end_chunk is now the start of the new chunk.
-    int new_bytes = te_helper(ssl, end_chunk, buf_size - bytes_read, new_chunk_size, found_zero);
+    int new_bytes = te_helper(ssl, end_chunk, buf_size - bytes_read, new_chunk_size, last_char);
     if (new_bytes < 0) {
       return -1;
     }
-    bytes_read += new_bytes + (bytes_read-new_chunk_size);
+    else {
+      bytes_read += new_bytes + (end_chunk-chunk_start);
+    }
+    return bytes_read;
   }
   while (bytes_read < msg_length) {
     int n = SSL_read(ssl, chunk_start + bytes_read, buf_size - bytes_read);
@@ -899,13 +904,12 @@ int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* fo
     }
     if (bytes_read+n > msg_length) {
       printf("Read %d bytes total but only needed %d\n", bytes_read+n, msg_length);
-      //printf("Buffer is:\n%s\nDone\n", chunk_start+bytes_read);
+      printf("Buffer is:\n%s\nDone\n", chunk_start+bytes_read);
       char* end_chunk = strstr(chunk_start + bytes_read, "\r\n");
       if (end_chunk == NULL) {
         error("ERROR with message as part of a chunk");
         return -1;
       }
-      // NEEDS WORK: Assumes only one follow-up message?
       char* new_chunk = end_chunk + 2;
       // The strstr is the start of the next message. new_chunk includes the chunk size value
       int new_chunk_size = n - (strstr(new_chunk, "\r\n") + 2 - (chunk_start+bytes_read));
@@ -917,11 +921,14 @@ int te_helper(SSL* ssl, char* chunk_start, int buf_size, int bytes_read, int* fo
       *end = 0;
       //printf("Message is:\n%s\nDone\n", end_chunk);
       // end_chunk is now the start of the new chunk.
-      int new_bytes = te_helper(ssl, end_chunk, buf_size - bytes_read, new_chunk_size, found_zero);
+      int new_bytes = te_helper(ssl, end_chunk, buf_size - bytes_read, new_chunk_size, last_char);
       if (new_bytes < 0) {
         return -1;
       }
-      bytes_read += new_bytes + (n-new_chunk_size);
+      else {
+        bytes_read += new_bytes + (end_chunk-(chunk_start+bytes_read));
+      }
+      break;
     }
     else {
       bytes_read += n;
